@@ -1,0 +1,24 @@
+{
+  "fetched_at": "2026-05-18 13:38:38",
+  "us_rate": 0.03568,
+  "india_rate": 0.065,
+  "blended_rate": 0.03568,
+  "us_rate_pct": 3.568,
+  "india_rate_pct": 6.5,
+  "blended_rate_pct": 3.568,
+  "us_rate_source": "^IRX (13-week T-bill, last close 3.568%)",
+  "india_rate_source": "fallback (IN10Y-IN.BO unavailable, default 6.5%)",
+  "portfolio": {
+    "total_stocks": 5,
+    "us_stocks": [
+      "INTC",
+      "MU",
+      "PLTR",
+      "SNOW",
+      "TSLA"
+    ],
+    "india_stocks": [],
+    "us_proportion": 1.0,
+    "india_proportion": 0.0
+  }
+}
