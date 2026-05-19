@@ -12,6 +12,9 @@ header{visibility:hidden!important}
 [data-testid="stDecoration"]{display:none!important}
 [data-testid="stStatusWidget"]{display:none!important}
 [data-testid="manage-app-button"]{display:none!important}
+.streamlit-wide{display:none!important}
+iframe[title="streamlit_feedback"]{display:none!important}
+div[class*="StatusWidget"]{display:none!important}
 
 /* ── Global ── */
 *,*::before,*::after{box-sizing:border-box!important}

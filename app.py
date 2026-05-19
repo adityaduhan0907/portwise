@@ -283,7 +283,7 @@ for i, h in enumerate(list(st.session_state.holdings)):
     with c2:
         s_val = st.number_input(
             f"Shares {i+1}", value=float(h["shares"]),
-            min_value=0.0, step=1.0, format="%.4f", key=f"s_{i}",
+            min_value=0.0, step=1.0, format="%d", key=f"s_{i}",
             label_visibility="collapsed" if i > 0 else "visible",
         )
         st.session_state.holdings[i]["shares"] = s_val
@@ -295,7 +295,7 @@ for i, h in enumerate(list(st.session_state.holdings)):
             st.rerun()
 
 if len(st.session_state.holdings) < MAX_STOCKS:
-    if st.button("+ Add Stock"):
+    if st.button("+ Add Stock", use_container_width=True):
         st.session_state.holdings.append({"ticker": "", "shares": 0.0})
         st.rerun()
 else:
@@ -342,7 +342,7 @@ for i, np_h in enumerate(list(st.session_state.new_positions)):
             st.rerun()
 
 if len(st.session_state.new_positions) < MAX_NEW_POSITIONS:
-    if st.button("+ Add Stock", key="add_new_pos"):
+    if st.button("+ Add Stock", key="add_new_pos", use_container_width=True):
         st.session_state.new_positions.append({"ticker": ""})
         st.rerun()
 else:
