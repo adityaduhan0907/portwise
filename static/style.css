@@ -15,6 +15,9 @@ header{visibility:hidden!important}
 .streamlit-wide{display:none!important}
 iframe[title="streamlit_feedback"]{display:none!important}
 div[class*="StatusWidget"]{display:none!important}
+div[data-testid="stAppViewBlockContainer"]+div{display:none!important}
+.st-emotion-cache-h5rgaw{display:none!important}
+div[class*="floating"]{display:none!important}
 
 /* ── Global ── */
 *,*::before,*::after{box-sizing:border-box!important}
@@ -28,7 +31,7 @@ html,body,[data-testid="stApp"]{
   margin:0 auto!important;background:#FFFFFF!important}
 
 /* ── App header ── */
-.portwise-header{padding:32px 0 24px!important}
+.portwise-header{padding:8px 0 24px!important}
 .portwise-title{
   font-family:'Inter',sans-serif!important;font-size:36px!important;
   font-weight:700!important;color:#0D1B2A!important;

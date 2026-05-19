@@ -282,8 +282,8 @@ for i, h in enumerate(list(st.session_state.holdings)):
         st.session_state.holdings[i]["ticker"] = t_val.strip().upper()
     with c2:
         s_val = st.number_input(
-            f"Shares {i+1}", value=float(h["shares"]),
-            min_value=0.0, step=1.0, format="%d", key=f"s_{i}",
+            f"Shares {i+1}", value=int(h["shares"]),
+            min_value=0, step=1, key=f"s_{i}",
             label_visibility="collapsed" if i > 0 else "visible",
         )
         st.session_state.holdings[i]["shares"] = s_val
