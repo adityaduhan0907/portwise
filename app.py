@@ -18,7 +18,12 @@ MAX_NEW_POSITIONS = 5
 SKIP_LABELS = {"Portfolio Return (%)", "Portfolio Volatility (%)", "Portfolio Sharpe Ratio", "", "nan"}
 INDIA_SFX = (".NS", ".BO")
 
-st.set_page_config(page_title="PORTWISE", page_icon="📊", layout="wide")
+st.set_page_config(
+    page_title="PORTWISE",
+    page_icon="📊",
+    layout="centered",
+    initial_sidebar_state="collapsed",
+)
 
 # --- Session state ---
 for _k, _v in [
@@ -227,18 +232,21 @@ def fetch_benchmark_returns():
 _PREMIUM_CSS = """
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
 <style>
+/* ── Force Streamlit base overrides ── */
+.stApp{background-color:#FFFFFF!important;font-family:'Inter',sans-serif!important}
+
 /* ── Hide Streamlit chrome ── */
 #MainMenu{visibility:hidden!important}
-header[data-testid="stHeader"]{display:none!important}
-footer{display:none!important}
-[data-testid="stToolbar"]{display:none!important}
+footer{visibility:hidden!important}
+header{visibility:hidden!important}
+.stDeployButton{display:none!important}
+[data-testid="stToolbar"]{visibility:hidden!important}
 [data-testid="stDecoration"]{display:none!important}
 [data-testid="stStatusWidget"]{display:none!important}
-.stDeployButton{display:none!important}
 [data-testid="manage-app-button"]{display:none!important}
 
 /* ── Global ── */
-*,*::before,*::after{box-sizing:border-box}
+*,*::before,*::after{box-sizing:border-box!important}
 html,body,[data-testid="stApp"]{
   font-family:'Inter',-apple-system,BlinkMacSystemFont,sans-serif!important;
   background:#FFFFFF!important;color:#0D1B2A!important}
@@ -249,14 +257,18 @@ html,body,[data-testid="stApp"]{
   margin:0 auto!important;background:#FFFFFF!important}
 
 /* ── Header ── */
-.portwise-header{padding:32px 0 24px}
+.portwise-header{padding:32px 0 24px!important}
 .portwise-title{
-  font-family:'Inter',sans-serif;font-size:36px;font-weight:700;
-  color:#0D1B2A;letter-spacing:-0.01em;margin:0 0 10px;line-height:1.1}
+  font-family:'Inter',sans-serif!important;font-size:36px!important;
+  font-weight:700!important;color:#0D1B2A!important;
+  letter-spacing:-0.01em!important;margin:0 0 10px!important;line-height:1.1!important}
 .portwise-subtitle{
-  font-family:'Inter',sans-serif;font-size:15px;font-weight:300;
-  color:#4A5568;margin:0 0 16px;line-height:1.6}
-.portwise-accent-line{width:48px;height:2px;background:#1B3A6B;border-radius:1px}
+  font-family:'Inter',sans-serif!important;font-size:15px!important;
+  font-weight:300!important;color:#4A5568!important;
+  margin:0 0 16px!important;line-height:1.6!important}
+.portwise-accent-line{
+  width:48px!important;height:2px!important;
+  background:#1B3A6B!important;border-radius:1px!important}
 
 /* ── Body typography ── */
 .stMarkdown p,.stMarkdown li{
@@ -340,29 +352,33 @@ html,body,[data-testid="stApp"]{
 [data-testid="stAlert"] p{font-family:'Inter',sans-serif!important;font-size:14px!important}
 
 /* ── Health score display ── */
-.health-score-container{padding:8px 0 20px}
+.health-score-container{padding:8px 0 20px!important}
 .health-score-number{
-  font-size:48px;font-weight:700;color:#0D1B2A;
-  font-family:'Inter',sans-serif;line-height:1}
+  font-size:48px!important;font-weight:700!important;color:#0D1B2A!important;
+  font-family:'Inter',sans-serif!important;line-height:1!important}
 .health-score-suffix{
-  font-size:24px;font-weight:300;color:#4A5568;font-family:'Inter',sans-serif}
+  font-size:24px!important;font-weight:300!important;
+  color:#4A5568!important;font-family:'Inter',sans-serif!important}
 .health-score-rating{
-  font-size:13px;font-weight:600;text-transform:uppercase;letter-spacing:0.1em;
-  color:#1B3A6B;font-family:'Inter',sans-serif;margin:8px 0 12px}
+  font-size:13px!important;font-weight:600!important;
+  text-transform:uppercase!important;letter-spacing:0.1em!important;
+  color:#1B3A6B!important;font-family:'Inter',sans-serif!important;margin:8px 0 12px!important}
 .health-progress-track{
-  width:100%;height:4px;background:#E2E8F0;border-radius:2px;margin-bottom:20px}
-.health-progress-fill{height:4px;background:#1B3A6B;border-radius:2px}
+  width:100%!important;height:4px!important;
+  background:#E2E8F0!important;border-radius:2px!important;margin-bottom:20px!important}
+.health-progress-fill{
+  height:4px!important;background:#1B3A6B!important;border-radius:2px!important}
 
 /* ── Cash slider display ── */
 .cash-display-value{
-  font-size:28px;font-weight:700;color:#0D1B2A;
-  font-family:'Inter',sans-serif;margin:4px 0 16px}
+  font-size:28px!important;font-weight:700!important;color:#0D1B2A!important;
+  font-family:'Inter',sans-serif!important;margin:4px 0 16px!important}
 
 /* ── Responsive ── */
 @media(max-width:600px){
   .main .block-container{padding:1rem!important}
-  .portwise-title{font-size:26px}
-  .health-score-number{font-size:36px}
+  .portwise-title{font-size:26px!important}
+  .health-score-number{font-size:36px!important}
 }
 </style>
 """
@@ -371,36 +387,40 @@ html,body,[data-testid="stApp"]{
 _TABLE_CSS = """
 <style>
 .tbl-card{
-  background:#FFFFFF;border:1px solid #E2E8F0;border-radius:12px;
-  padding:24px;box-shadow:0 1px 4px rgba(0,0,0,0.06);margin-bottom:24px;overflow:hidden}
-.tbl{overflow-x:auto;-webkit-overflow-scrolling:touch}
+  background:#FFFFFF!important;border:1px solid #E2E8F0!important;border-radius:12px!important;
+  padding:24px!important;box-shadow:0 1px 4px rgba(0,0,0,0.06)!important;
+  margin-bottom:24px!important;overflow:hidden!important}
+.tbl{overflow-x:auto!important;-webkit-overflow-scrolling:touch!important}
 .tbl table{
-  border-collapse:collapse;width:100%;min-width:480px;
-  font-size:14px;font-family:'Inter',-apple-system,sans-serif}
+  border-collapse:collapse!important;width:100%!important;min-width:480px!important;
+  font-size:14px!important;font-family:'Inter',-apple-system,sans-serif!important}
 .tbl caption{
-  text-align:left;font-size:13px;font-weight:400;color:#4A5568;
-  padding:0 0 16px;font-family:'Inter',sans-serif;line-height:1.5}
+  text-align:left!important;font-size:13px!important;font-weight:400!important;
+  color:#4A5568!important;padding:0 0 16px!important;
+  font-family:'Inter',sans-serif!important;line-height:1.5!important}
 .tbl th{
-  background:#F7F9FC;padding:12px 16px;text-align:left;
-  border-bottom:2px solid #E2E8F0;white-space:nowrap;font-weight:600;
-  font-size:13px;text-transform:uppercase;letter-spacing:0.08em;
-  color:#4A5568;font-family:'Inter',sans-serif}
+  background:#F7F9FC!important;padding:12px 16px!important;text-align:left!important;
+  border-bottom:2px solid #E2E8F0!important;white-space:nowrap!important;
+  font-weight:600!important;font-size:13px!important;text-transform:uppercase!important;
+  letter-spacing:0.08em!important;color:#4A5568!important;font-family:'Inter',sans-serif!important}
 .tbl td{
-  padding:12px 16px;border-bottom:1px solid #F0F4F8;white-space:nowrap;
-  font-size:14px;color:#0D1B2A;font-family:'Inter',sans-serif}
-.tbl tbody tr:nth-child(even):not(.buy-row):not(.sell-row):not(.total) td{background:#FAFBFD}
+  padding:12px 16px!important;border-bottom:1px solid #F0F4F8!important;
+  white-space:nowrap!important;font-size:14px!important;
+  color:#0D1B2A!important;font-family:'Inter',sans-serif!important}
+.tbl tbody tr:nth-child(even):not(.buy-row):not(.sell-row):not(.total) td{
+  background:#FAFBFD!important}
 .tbl tr.total td{
-  font-weight:600;border-top:2px solid #E2E8F0;border-bottom:none;
-  background:#F7F9FC!important;color:#0D1B2A}
-.tbl tr.buy-row td{background:#F0FFF8!important;color:#1A4731}
-.tbl tr.buy-row td.act{color:#1A4731;font-weight:600}
-.tbl tr.sell-row td{background:#FFF5F5!important;color:#7B1D1D}
-.tbl tr.sell-row td.act{color:#7B1D1D;font-weight:600}
-.tbl.wrap-last td:last-child{white-space:normal;min-width:180px}
+  font-weight:600!important;border-top:2px solid #E2E8F0!important;
+  border-bottom:none!important;background:#F7F9FC!important;color:#0D1B2A!important}
+.tbl tr.buy-row td{background:#F0FFF8!important;color:#1A4731!important}
+.tbl tr.buy-row td.act{color:#1A4731!important;font-weight:600!important}
+.tbl tr.sell-row td{background:#FFF5F5!important;color:#7B1D1D!important}
+.tbl tr.sell-row td.act{color:#7B1D1D!important;font-weight:600!important}
+.tbl.wrap-last td:last-child{white-space:normal!important;min-width:180px!important}
 @media(max-width:600px){
-  .tbl-card{padding:14px;border-radius:8px}
-  .tbl table{font-size:12px;min-width:0}
-  .tbl th,.tbl td{padding:8px 10px}
+  .tbl-card{padding:14px!important;border-radius:8px!important}
+  .tbl table{font-size:12px!important;min-width:0!important}
+  .tbl th,.tbl td{padding:8px 10px!important}
 }
 </style>
 """
@@ -432,7 +452,7 @@ st.markdown(_PREMIUM_CSS, unsafe_allow_html=True)
 st.markdown(
     '<div class="portwise-header">'
     '<div class="portwise-title">PORTWISE</div>'
-    '<div class="portwise-subtitle">Enter your stocks and get a personalized rebalancing plan in seconds</div>'
+    '<div class="portwise-subtitle">Smart guide to rebalance your portfolio in seconds</div>'
     '<div class="portwise-accent-line"></div>'
     '</div>',
     unsafe_allow_html=True,
