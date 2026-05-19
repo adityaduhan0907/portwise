@@ -18,7 +18,7 @@ MAX_NEW_POSITIONS = 5
 SKIP_LABELS = {"Portfolio Return (%)", "Portfolio Volatility (%)", "Portfolio Sharpe Ratio", "", "nan"}
 INDIA_SFX = (".NS", ".BO")
 
-st.set_page_config(page_title="Portfolio Optimizer", page_icon="📊", layout="wide")
+st.set_page_config(page_title="PORTWISE", page_icon="📊", layout="wide")
 
 # --- Session state ---
 for _k, _v in [
@@ -223,31 +223,184 @@ def fetch_benchmark_returns():
     return out
 
 
-# Shared CSS — injected once when results render
+# Premium global CSS — injected once at page load
+_PREMIUM_CSS = """
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+<style>
+/* ── Hide Streamlit chrome ── */
+#MainMenu{visibility:hidden!important}
+header[data-testid="stHeader"]{display:none!important}
+footer{display:none!important}
+[data-testid="stToolbar"]{display:none!important}
+[data-testid="stDecoration"]{display:none!important}
+[data-testid="stStatusWidget"]{display:none!important}
+.stDeployButton{display:none!important}
+[data-testid="manage-app-button"]{display:none!important}
+
+/* ── Global ── */
+*,*::before,*::after{box-sizing:border-box}
+html,body,[data-testid="stApp"]{
+  font-family:'Inter',-apple-system,BlinkMacSystemFont,sans-serif!important;
+  background:#FFFFFF!important;color:#0D1B2A!important}
+
+/* ── Container ── */
+.main .block-container{
+  max-width:720px!important;padding:2rem 1.5rem 4rem!important;
+  margin:0 auto!important;background:#FFFFFF!important}
+
+/* ── Header ── */
+.portwise-header{padding:32px 0 24px}
+.portwise-title{
+  font-family:'Inter',sans-serif;font-size:36px;font-weight:700;
+  color:#0D1B2A;letter-spacing:-0.01em;margin:0 0 10px;line-height:1.1}
+.portwise-subtitle{
+  font-family:'Inter',sans-serif;font-size:15px;font-weight:300;
+  color:#4A5568;margin:0 0 16px;line-height:1.6}
+.portwise-accent-line{width:48px;height:2px;background:#1B3A6B;border-radius:1px}
+
+/* ── Body typography ── */
+.stMarkdown p,.stMarkdown li{
+  font-family:'Inter',sans-serif!important;font-size:15px!important;
+  font-weight:400!important;color:#0D1B2A!important;line-height:1.6!important}
+.stMarkdown strong{font-weight:600!important;color:#0D1B2A!important}
+.stMarkdown h4{
+  font-family:'Inter',sans-serif!important;font-size:18px!important;
+  font-weight:600!important;color:#0D1B2A!important;margin:24px 0 8px!important}
+[data-testid="stCaptionContainer"] p{
+  font-family:'Inter',sans-serif!important;font-size:13px!important;
+  font-weight:400!important;color:#4A5568!important}
+[data-testid="stHeadingWithActionElements"] h2,
+[data-testid="stHeadingWithActionElements"] h3{
+  font-family:'Inter',sans-serif!important;font-size:20px!important;
+  font-weight:600!important;color:#0D1B2A!important}
+
+/* ── Input fields ── */
+.stTextInput>div>div>input,
+.stNumberInput>div>div>input{
+  border:1px solid #E2E8F0!important;border-radius:8px!important;
+  padding:12px 16px!important;font-size:15px!important;
+  font-family:'Inter',sans-serif!important;background:#FFFFFF!important;
+  color:#0D1B2A!important;box-shadow:none!important;transition:border-color 0.15s!important}
+.stTextInput>div>div>input:focus,
+.stNumberInput>div>div>input:focus{
+  border-color:#1B3A6B!important;
+  box-shadow:0 0 0 3px rgba(27,58,107,0.08)!important;outline:none!important}
+
+/* Input / select labels */
+.stTextInput label p,.stNumberInput label p,.stSelectbox label p{
+  font-family:'Inter',sans-serif!important;font-size:13px!important;
+  font-weight:500!important;text-transform:uppercase!important;
+  letter-spacing:0.06em!important;color:#4A5568!important}
+
+/* ── Selectbox ── */
+.stSelectbox>div>div{
+  border:1px solid #E2E8F0!important;border-radius:8px!important;
+  background:#FFFFFF!important;font-family:'Inter',sans-serif!important;
+  font-size:15px!important;color:#0D1B2A!important}
+
+/* ── Buttons ── */
+.stButton>button[kind="primary"]{
+  background:#1B3A6B!important;color:#FFFFFF!important;border:none!important;
+  border-radius:8px!important;padding:16px 24px!important;font-size:16px!important;
+  font-weight:600!important;font-family:'Inter',sans-serif!important;
+  letter-spacing:0.04em!important;box-shadow:0 2px 8px rgba(27,58,107,0.3)!important;
+  transition:background 0.15s,box-shadow 0.15s!important;width:100%!important}
+.stButton>button[kind="primary"]:hover{
+  background:#0D2548!important;box-shadow:0 4px 12px rgba(27,58,107,0.4)!important}
+.stButton>button[kind="primary"]:disabled{
+  background:#A0AEC0!important;box-shadow:none!important}
+.stButton>button[kind="secondary"]{
+  border:1px solid #1B3A6B!important;color:#1B3A6B!important;
+  background:transparent!important;border-radius:8px!important;
+  padding:10px 20px!important;font-size:14px!important;font-weight:500!important;
+  font-family:'Inter',sans-serif!important;box-shadow:none!important;
+  transition:all 0.15s!important}
+.stButton>button[kind="secondary"]:hover{
+  background:#E8EDF5!important;border-color:#0D2548!important;color:#0D2548!important}
+[data-testid="stDownloadButton"]>button{
+  background:#1B3A6B!important;color:#FFFFFF!important;border:none!important;
+  border-radius:8px!important;padding:16px 24px!important;font-size:15px!important;
+  font-weight:600!important;font-family:'Inter',sans-serif!important;
+  box-shadow:0 2px 8px rgba(27,58,107,0.3)!important;
+  width:100%!important;letter-spacing:0.04em!important}
+[data-testid="stDownloadButton"]>button:hover{background:#0D2548!important}
+
+/* ── Divider ── */
+[data-testid="stDivider"] hr,hr{
+  border:none!important;border-top:1px solid #E2E8F0!important;margin:28px 0!important}
+
+/* ── Slider ── */
+[data-testid="stSlider"] label p{
+  font-family:'Inter',sans-serif!important;font-size:13px!important;
+  font-weight:500!important;text-transform:uppercase!important;
+  letter-spacing:0.06em!important;color:#4A5568!important}
+
+/* ── Alert boxes ── */
+[data-testid="stAlert"]{border-radius:8px!important;font-family:'Inter',sans-serif!important}
+[data-testid="stAlert"] p{font-family:'Inter',sans-serif!important;font-size:14px!important}
+
+/* ── Health score display ── */
+.health-score-container{padding:8px 0 20px}
+.health-score-number{
+  font-size:48px;font-weight:700;color:#0D1B2A;
+  font-family:'Inter',sans-serif;line-height:1}
+.health-score-suffix{
+  font-size:24px;font-weight:300;color:#4A5568;font-family:'Inter',sans-serif}
+.health-score-rating{
+  font-size:13px;font-weight:600;text-transform:uppercase;letter-spacing:0.1em;
+  color:#1B3A6B;font-family:'Inter',sans-serif;margin:8px 0 12px}
+.health-progress-track{
+  width:100%;height:4px;background:#E2E8F0;border-radius:2px;margin-bottom:20px}
+.health-progress-fill{height:4px;background:#1B3A6B;border-radius:2px}
+
+/* ── Cash slider display ── */
+.cash-display-value{
+  font-size:28px;font-weight:700;color:#0D1B2A;
+  font-family:'Inter',sans-serif;margin:4px 0 16px}
+
+/* ── Responsive ── */
+@media(max-width:600px){
+  .main .block-container{padding:1rem!important}
+  .portwise-title{font-size:26px}
+  .health-score-number{font-size:36px}
+}
+</style>
+"""
+
+# Table CSS — injected once when results render
 _TABLE_CSS = """
 <style>
-.tbl{overflow-x:auto;-webkit-overflow-scrolling:touch;margin:4px 0 24px}
-.tbl table{border-collapse:collapse;width:100%;min-width:480px;font-size:14px;font-family:inherit}
-.tbl caption{text-align:left;font-weight:600;font-size:15px;padding:0 0 8px;color:inherit}
-.tbl th{background:#F0F2F6;padding:9px 14px;text-align:left;border-bottom:2px solid #CCC;
-        white-space:nowrap;font-weight:600}
-.tbl td{padding:8px 14px;border-bottom:1px solid #EBEBEB;white-space:nowrap}
-.tbl tr.total td{font-weight:700;border-top:2px solid #CCC;border-bottom:none;background:#FAFAFA}
-.tbl tr.buy-row{background:#F0FFF4}
-.tbl tr.buy-row td.act{color:#276749}
-.tbl tr.sell-row{background:#FFF5F5}
-.tbl tr.sell-row td.act{color:#9B2335}
+.tbl-card{
+  background:#FFFFFF;border:1px solid #E2E8F0;border-radius:12px;
+  padding:24px;box-shadow:0 1px 4px rgba(0,0,0,0.06);margin-bottom:24px;overflow:hidden}
+.tbl{overflow-x:auto;-webkit-overflow-scrolling:touch}
+.tbl table{
+  border-collapse:collapse;width:100%;min-width:480px;
+  font-size:14px;font-family:'Inter',-apple-system,sans-serif}
+.tbl caption{
+  text-align:left;font-size:13px;font-weight:400;color:#4A5568;
+  padding:0 0 16px;font-family:'Inter',sans-serif;line-height:1.5}
+.tbl th{
+  background:#F7F9FC;padding:12px 16px;text-align:left;
+  border-bottom:2px solid #E2E8F0;white-space:nowrap;font-weight:600;
+  font-size:13px;text-transform:uppercase;letter-spacing:0.08em;
+  color:#4A5568;font-family:'Inter',sans-serif}
+.tbl td{
+  padding:12px 16px;border-bottom:1px solid #F0F4F8;white-space:nowrap;
+  font-size:14px;color:#0D1B2A;font-family:'Inter',sans-serif}
+.tbl tbody tr:nth-child(even):not(.buy-row):not(.sell-row):not(.total) td{background:#FAFBFD}
+.tbl tr.total td{
+  font-weight:600;border-top:2px solid #E2E8F0;border-bottom:none;
+  background:#F7F9FC!important;color:#0D1B2A}
+.tbl tr.buy-row td{background:#F0FFF8!important;color:#1A4731}
+.tbl tr.buy-row td.act{color:#1A4731;font-weight:600}
+.tbl tr.sell-row td{background:#FFF5F5!important;color:#7B1D1D}
+.tbl tr.sell-row td.act{color:#7B1D1D;font-weight:600}
 .tbl.wrap-last td:last-child{white-space:normal;min-width:180px}
-@media(prefers-color-scheme:dark){
-  .tbl th{background:#2D3748;border-bottom-color:#4A5568}
-  .tbl td{border-bottom-color:#2D3748}
-  .tbl tr.total td{background:#1A202C}
-  .tbl tr.buy-row{background:#1C3A2A}
-  .tbl tr.sell-row{background:#3A1C1C}
-}
 @media(max-width:600px){
-  .tbl table{font-size:12px}
-  .tbl th,.tbl td{padding:6px 8px}
+  .tbl-card{padding:14px;border-radius:8px}
+  .tbl table{font-size:12px;min-width:0}
+  .tbl th,.tbl td{padding:8px 10px}
 }
 </style>
 """
@@ -256,8 +409,8 @@ _TABLE_CSS = """
 def render_table(caption, headers, rows, row_classes=None, wrap_last=False):
     if row_classes is None:
         row_classes = [""] * len(rows)
-    wrapper_cls = "tbl wrap-last" if wrap_last else "tbl"
-    html = f'<div class="{wrapper_cls}"><table><caption>{caption}</caption><thead><tr>'
+    inner_cls = "tbl wrap-last" if wrap_last else "tbl"
+    html = f'<div class="tbl-card"><div class="{inner_cls}"><table><caption>{caption}</caption><thead><tr>'
     for h in headers:
         html += f'<th scope="col">{h}</th>'
     html += "</tr></thead><tbody>"
@@ -267,7 +420,7 @@ def render_table(caption, headers, rows, row_classes=None, wrap_last=False):
             td_cls = ' class="act"' if ci == 0 and cls in ("buy-row", "sell-row") else ""
             html += f"<td{td_cls}>{cell}</td>"
         html += "</tr>"
-    html += "</tbody></table></div>"
+    html += "</tbody></table></div></div>"
     return html
 
 
@@ -275,8 +428,15 @@ def render_table(caption, headers, rows, row_classes=None, wrap_last=False):
 # UI — Form
 # ═══════════════════════════════════════════════════════════════
 
-st.title("Portfolio Optimizer")
-st.caption("Mean-variance optimization with a personalized rebalancing plan.")
+st.markdown(_PREMIUM_CSS, unsafe_allow_html=True)
+st.markdown(
+    '<div class="portwise-header">'
+    '<div class="portwise-title">PORTWISE</div>'
+    '<div class="portwise-subtitle">Enter your stocks and get a personalized rebalancing plan in seconds</div>'
+    '<div class="portwise-accent-line"></div>'
+    '</div>',
+    unsafe_allow_html=True,
+)
 st.divider()
 
 _ccy = st.selectbox("**Currency**", ["USD — US Dollar", "INR — Indian Rupee"])
@@ -318,7 +478,7 @@ else:
 st.divider()
 st.markdown("#### Stocks I want to add to my portfolio")
 st.markdown(
-    "<p style='color:grey;font-size:13px;margin-top:-8px'>"
+    "<p style='color:#4A5568;font-size:13px;font-family:Inter,sans-serif;margin-top:-8px'>"
     "Don't own these yet — the optimizer will recommend how many units to buy "
     "based on your portfolio size</p>",
     unsafe_allow_html=True,
@@ -330,7 +490,7 @@ if st.session_state.new_positions:
         st.markdown("**Ticker**")
     with _nh2:
         st.markdown(
-            "<span style='color:grey;font-size:14px'>New position</span>",
+            "<span style='color:#4A5568;font-size:14px;font-family:Inter,sans-serif'>New position</span>",
             unsafe_allow_html=True,
         )
 
@@ -345,8 +505,8 @@ for i, np_h in enumerate(list(st.session_state.new_positions)):
         st.session_state.new_positions[i]["ticker"] = np_val.strip().upper()
     with nc2:
         st.markdown(
-            "<div style='padding-top:8px;color:grey;font-style:italic;font-size:13px'>"
-            "New position</div>",
+            "<div style='padding-top:8px;color:#4A5568;font-style:italic;"
+            "font-size:13px;font-family:Inter,sans-serif'>New position</div>",
             unsafe_allow_html=True,
         )
     with nc3:
@@ -754,10 +914,17 @@ if st.session_state.results:
         elif _total_score >= 4.0: _rating = "Needs Attention"
         else:                     _rating = "Poor"
 
+        _progress_pct = min(_total_score / 10 * 100, 100)
         st.markdown(
-            f'<div aria-live="polite">'
-            f'<p style="font-size:48px;font-weight:700;margin:0 0 4px">{_total_score} / 10</p>'
-            f'<p style="font-size:18px;margin:0 0 16px">{_rating}</p>'
+            f'<div class="health-score-container" aria-live="polite">'
+            f'<div style="margin:0 0 4px">'
+            f'<span class="health-score-number">{_total_score}</span>'
+            f'<span class="health-score-suffix">&thinsp;/ 10</span>'
+            f'</div>'
+            f'<div class="health-score-rating">{_rating}</div>'
+            f'<div class="health-progress-track">'
+            f'<div class="health-progress-fill" style="width:{_progress_pct:.1f}%"></div>'
+            f'</div>'
             f'</div>',
             unsafe_allow_html=True,
         )
@@ -947,8 +1114,8 @@ if st.session_state.results:
         _disp_val = (f"₹{_add_usd * usd_inr:,.0f}" if currency == "INR"
                      else f"${_add_usd:,.2f}")
         st.markdown(
-            f'<p style="font-size:28px;font-weight:700;margin:4px 0" '
-            f'aria-label="Additional investment: {_disp_val}">{_disp_val}</p>',
+            f'<p class="cash-display-value" aria-label="Additional investment: {_disp_val}">'
+            f'{_disp_val}</p>',
             unsafe_allow_html=True,
         )
 
