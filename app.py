@@ -25,6 +25,10 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
+with open(os.path.join(SCRIPT_DIR, "static", "style.css")) as f:
+    css = f.read()
+st.markdown(f"<style>{css}</style>", unsafe_allow_html=True)
+
 # --- Session state ---
 for _k, _v in [
     ("holdings", [{"ticker": "", "shares": 0.0}]),
@@ -228,202 +232,6 @@ def fetch_benchmark_returns():
     return out
 
 
-# Premium global CSS — injected once at page load
-_PREMIUM_CSS = """
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
-<style>
-/* ── Force Streamlit base overrides ── */
-.stApp{background-color:#FFFFFF!important;font-family:'Inter',sans-serif!important}
-
-/* ── Hide Streamlit chrome ── */
-#MainMenu{visibility:hidden!important}
-footer{visibility:hidden!important}
-header{visibility:hidden!important}
-.stDeployButton{display:none!important}
-[data-testid="stToolbar"]{visibility:hidden!important}
-[data-testid="stDecoration"]{display:none!important}
-[data-testid="stStatusWidget"]{display:none!important}
-[data-testid="manage-app-button"]{display:none!important}
-
-/* ── Global ── */
-*,*::before,*::after{box-sizing:border-box!important}
-html,body,[data-testid="stApp"]{
-  font-family:'Inter',-apple-system,BlinkMacSystemFont,sans-serif!important;
-  background:#FFFFFF!important;color:#0D1B2A!important}
-
-/* ── Container ── */
-.main .block-container{
-  max-width:720px!important;padding:2rem 1.5rem 4rem!important;
-  margin:0 auto!important;background:#FFFFFF!important}
-
-/* ── Header ── */
-.portwise-header{padding:32px 0 24px!important}
-.portwise-title{
-  font-family:'Inter',sans-serif!important;font-size:36px!important;
-  font-weight:700!important;color:#0D1B2A!important;
-  letter-spacing:-0.01em!important;margin:0 0 10px!important;line-height:1.1!important}
-.portwise-subtitle{
-  font-family:'Inter',sans-serif!important;font-size:15px!important;
-  font-weight:300!important;color:#4A5568!important;
-  margin:0 0 16px!important;line-height:1.6!important}
-.portwise-accent-line{
-  width:48px!important;height:2px!important;
-  background:#1B3A6B!important;border-radius:1px!important}
-
-/* ── Body typography ── */
-.stMarkdown p,.stMarkdown li{
-  font-family:'Inter',sans-serif!important;font-size:15px!important;
-  font-weight:400!important;color:#0D1B2A!important;line-height:1.6!important}
-.stMarkdown strong{font-weight:600!important;color:#0D1B2A!important}
-.stMarkdown h4{
-  font-family:'Inter',sans-serif!important;font-size:18px!important;
-  font-weight:600!important;color:#0D1B2A!important;margin:24px 0 8px!important}
-[data-testid="stCaptionContainer"] p{
-  font-family:'Inter',sans-serif!important;font-size:13px!important;
-  font-weight:400!important;color:#4A5568!important}
-[data-testid="stHeadingWithActionElements"] h2,
-[data-testid="stHeadingWithActionElements"] h3{
-  font-family:'Inter',sans-serif!important;font-size:20px!important;
-  font-weight:600!important;color:#0D1B2A!important}
-
-/* ── Input fields ── */
-.stTextInput>div>div>input,
-.stNumberInput>div>div>input{
-  border:1px solid #E2E8F0!important;border-radius:8px!important;
-  padding:12px 16px!important;font-size:15px!important;
-  font-family:'Inter',sans-serif!important;background:#FFFFFF!important;
-  color:#0D1B2A!important;box-shadow:none!important;transition:border-color 0.15s!important}
-.stTextInput>div>div>input:focus,
-.stNumberInput>div>div>input:focus{
-  border-color:#1B3A6B!important;
-  box-shadow:0 0 0 3px rgba(27,58,107,0.08)!important;outline:none!important}
-
-/* Input / select labels */
-.stTextInput label p,.stNumberInput label p,.stSelectbox label p{
-  font-family:'Inter',sans-serif!important;font-size:13px!important;
-  font-weight:500!important;text-transform:uppercase!important;
-  letter-spacing:0.06em!important;color:#4A5568!important}
-
-/* ── Selectbox ── */
-.stSelectbox>div>div{
-  border:1px solid #E2E8F0!important;border-radius:8px!important;
-  background:#FFFFFF!important;font-family:'Inter',sans-serif!important;
-  font-size:15px!important;color:#0D1B2A!important}
-
-/* ── Buttons ── */
-.stButton>button[kind="primary"]{
-  background:#1B3A6B!important;color:#FFFFFF!important;border:none!important;
-  border-radius:8px!important;padding:16px 24px!important;font-size:16px!important;
-  font-weight:600!important;font-family:'Inter',sans-serif!important;
-  letter-spacing:0.04em!important;box-shadow:0 2px 8px rgba(27,58,107,0.3)!important;
-  transition:background 0.15s,box-shadow 0.15s!important;width:100%!important}
-.stButton>button[kind="primary"]:hover{
-  background:#0D2548!important;box-shadow:0 4px 12px rgba(27,58,107,0.4)!important}
-.stButton>button[kind="primary"]:disabled{
-  background:#A0AEC0!important;box-shadow:none!important}
-.stButton>button[kind="secondary"]{
-  border:1px solid #1B3A6B!important;color:#1B3A6B!important;
-  background:transparent!important;border-radius:8px!important;
-  padding:10px 20px!important;font-size:14px!important;font-weight:500!important;
-  font-family:'Inter',sans-serif!important;box-shadow:none!important;
-  transition:all 0.15s!important}
-.stButton>button[kind="secondary"]:hover{
-  background:#E8EDF5!important;border-color:#0D2548!important;color:#0D2548!important}
-[data-testid="stDownloadButton"]>button{
-  background:#1B3A6B!important;color:#FFFFFF!important;border:none!important;
-  border-radius:8px!important;padding:16px 24px!important;font-size:15px!important;
-  font-weight:600!important;font-family:'Inter',sans-serif!important;
-  box-shadow:0 2px 8px rgba(27,58,107,0.3)!important;
-  width:100%!important;letter-spacing:0.04em!important}
-[data-testid="stDownloadButton"]>button:hover{background:#0D2548!important}
-
-/* ── Divider ── */
-[data-testid="stDivider"] hr,hr{
-  border:none!important;border-top:1px solid #E2E8F0!important;margin:28px 0!important}
-
-/* ── Slider ── */
-[data-testid="stSlider"] label p{
-  font-family:'Inter',sans-serif!important;font-size:13px!important;
-  font-weight:500!important;text-transform:uppercase!important;
-  letter-spacing:0.06em!important;color:#4A5568!important}
-
-/* ── Alert boxes ── */
-[data-testid="stAlert"]{border-radius:8px!important;font-family:'Inter',sans-serif!important}
-[data-testid="stAlert"] p{font-family:'Inter',sans-serif!important;font-size:14px!important}
-
-/* ── Health score display ── */
-.health-score-container{padding:8px 0 20px!important}
-.health-score-number{
-  font-size:48px!important;font-weight:700!important;color:#0D1B2A!important;
-  font-family:'Inter',sans-serif!important;line-height:1!important}
-.health-score-suffix{
-  font-size:24px!important;font-weight:300!important;
-  color:#4A5568!important;font-family:'Inter',sans-serif!important}
-.health-score-rating{
-  font-size:13px!important;font-weight:600!important;
-  text-transform:uppercase!important;letter-spacing:0.1em!important;
-  color:#1B3A6B!important;font-family:'Inter',sans-serif!important;margin:8px 0 12px!important}
-.health-progress-track{
-  width:100%!important;height:4px!important;
-  background:#E2E8F0!important;border-radius:2px!important;margin-bottom:20px!important}
-.health-progress-fill{
-  height:4px!important;background:#1B3A6B!important;border-radius:2px!important}
-
-/* ── Cash slider display ── */
-.cash-display-value{
-  font-size:28px!important;font-weight:700!important;color:#0D1B2A!important;
-  font-family:'Inter',sans-serif!important;margin:4px 0 16px!important}
-
-/* ── Responsive ── */
-@media(max-width:600px){
-  .main .block-container{padding:1rem!important}
-  .portwise-title{font-size:26px!important}
-  .health-score-number{font-size:36px!important}
-}
-</style>
-"""
-
-# Table CSS — injected once when results render
-_TABLE_CSS = """
-<style>
-.tbl-card{
-  background:#FFFFFF!important;border:1px solid #E2E8F0!important;border-radius:12px!important;
-  padding:24px!important;box-shadow:0 1px 4px rgba(0,0,0,0.06)!important;
-  margin-bottom:24px!important;overflow:hidden!important}
-.tbl{overflow-x:auto!important;-webkit-overflow-scrolling:touch!important}
-.tbl table{
-  border-collapse:collapse!important;width:100%!important;min-width:480px!important;
-  font-size:14px!important;font-family:'Inter',-apple-system,sans-serif!important}
-.tbl caption{
-  text-align:left!important;font-size:13px!important;font-weight:400!important;
-  color:#4A5568!important;padding:0 0 16px!important;
-  font-family:'Inter',sans-serif!important;line-height:1.5!important}
-.tbl th{
-  background:#F7F9FC!important;padding:12px 16px!important;text-align:left!important;
-  border-bottom:2px solid #E2E8F0!important;white-space:nowrap!important;
-  font-weight:600!important;font-size:13px!important;text-transform:uppercase!important;
-  letter-spacing:0.08em!important;color:#4A5568!important;font-family:'Inter',sans-serif!important}
-.tbl td{
-  padding:12px 16px!important;border-bottom:1px solid #F0F4F8!important;
-  white-space:nowrap!important;font-size:14px!important;
-  color:#0D1B2A!important;font-family:'Inter',sans-serif!important}
-.tbl tbody tr:nth-child(even):not(.buy-row):not(.sell-row):not(.total) td{
-  background:#FAFBFD!important}
-.tbl tr.total td{
-  font-weight:600!important;border-top:2px solid #E2E8F0!important;
-  border-bottom:none!important;background:#F7F9FC!important;color:#0D1B2A!important}
-.tbl tr.buy-row td{background:#F0FFF8!important;color:#1A4731!important}
-.tbl tr.buy-row td.act{color:#1A4731!important;font-weight:600!important}
-.tbl tr.sell-row td{background:#FFF5F5!important;color:#7B1D1D!important}
-.tbl tr.sell-row td.act{color:#7B1D1D!important;font-weight:600!important}
-.tbl.wrap-last td:last-child{white-space:normal!important;min-width:180px!important}
-@media(max-width:600px){
-  .tbl-card{padding:14px!important;border-radius:8px!important}
-  .tbl table{font-size:12px!important;min-width:0!important}
-  .tbl th,.tbl td{padding:8px 10px!important}
-}
-</style>
-"""
 
 
 def render_table(caption, headers, rows, row_classes=None, wrap_last=False):
@@ -448,7 +256,6 @@ def render_table(caption, headers, rows, row_classes=None, wrap_last=False):
 # UI — Form
 # ═══════════════════════════════════════════════════════════════
 
-st.markdown(_PREMIUM_CSS, unsafe_allow_html=True)
 st.markdown(
     '<div class="portwise-header">'
     '<div class="portwise-title">PORTWISE</div>'
@@ -613,7 +420,6 @@ if st.session_state.results:
         st.warning(f"Could not find prices for: {', '.join(R['bad'])}. These were excluded.")
 
     st.divider()
-    st.markdown(_TABLE_CSS, unsafe_allow_html=True)
 
     prices_latest, prices_df = load_prices_for_display()
 
