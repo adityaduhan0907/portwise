@@ -4,6 +4,7 @@ import math
 import os
 import subprocess
 import sys
+import time
 import warnings
 from datetime import datetime
 
@@ -12,11 +13,69 @@ import streamlit as st
 
 warnings.filterwarnings("ignore")
 
+
+def fetch_with_retry(fetch_fn, max_retries=3, delay=2):
+    """Retry a zero-argument callable up to max_retries times."""
+    for attempt in range(max_retries):
+        try:
+            return fetch_fn()
+        except Exception as exc:
+            if attempt < max_retries - 1:
+                time.sleep(delay)
+            else:
+                raise exc
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 MAX_STOCKS = 15
 MAX_NEW_POSITIONS = 5
 SKIP_LABELS = {"Portfolio Return (%)", "Portfolio Volatility (%)", "Portfolio Sharpe Ratio", "", "nan"}
 INDIA_SFX = (".NS", ".BO")
+
+# ── Market constants ────────────────────────────────────────────────────────────
+ERP_USA          = 0.058093
+ERP_INDIA        = 0.0750
+RF_INDIA         = 0.0675
+IMPLIED_PE_USA   = 23.8425
+IMPLIED_PE_INDIA = 20.0
+
+
+@st.cache_data(show_spinner=False)
+def load_company_list():
+    """Load US and India company lists from company_list.xlsx. Cached for session."""
+    path = os.path.join(SCRIPT_DIR, "company_list.xlsx")
+    if not os.path.exists(path):
+        return None
+    try:
+        frames = []
+        xf = pd.ExcelFile(path)
+        if "US Companies" in xf.sheet_names:
+            us = pd.read_excel(path, sheet_name="US Companies")
+            us["Market"] = "USA"
+            frames.append(us)
+        if "India Companies" in xf.sheet_names:
+            ind = pd.read_excel(path, sheet_name="India Companies")
+            ind["Market"] = "India"
+            frames.append(ind)
+        return pd.concat(frames, ignore_index=True) if frames else None
+    except Exception:
+        return None
+
+
+def _filter_options(query, company_df, market):
+    """Return up to 10 Search strings matching query, filtered by market (USA or India)."""
+    if company_df is None or not query or not query.strip():
+        return []
+    df = company_df[company_df["Market"] == market]
+    q = query.strip().lower()
+    mask = df["Search"].str.lower().str.contains(q, na=False)
+    return df[mask]["Search"].dropna().tolist()[:10]
+
+
+def _extract_ticker(sel):
+    """Pull ticker out of 'Company Name (TICKER)' string."""
+    if sel and "(" in sel:
+        return sel.rsplit("(", 1)[-1].rstrip(")")
+    return ""
 
 st.set_page_config(
     page_title="PORTWISE",
@@ -35,6 +94,7 @@ for _k, _v in [
     ("new_positions", []),
     ("results", None),
     ("error", None),
+    ("mkt_active", "USA"),
 ]:
     if _k not in st.session_state:
         st.session_state[_k] = _v
@@ -62,12 +122,34 @@ def run_module(name, timeout=300):
 def get_usd_inr():
     try:
         import yfinance as yf
-        h = yf.Ticker("USDINR=X").history(period="3d")
+        h = fetch_with_retry(lambda: yf.Ticker("USDINR=X").history(period="3d"))
         if not h.empty:
             return float(h["Close"].iloc[-1])
     except Exception:
         pass
     return 84.0
+
+
+def load_risk_free_rate():
+    """Read the blended risk-free rate from risk_free_rates.json."""
+    try:
+        with open(os.path.join(SCRIPT_DIR, "risk_free_rates.json"), encoding="utf-8") as f:
+            return float(json.load(f)["blended_rate"])
+    except Exception:
+        return 0.043
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_capm_returns():
+    """Return {ticker: capm_expected_return} from returns_stats.xlsx CAPM Returns sheet."""
+    path = os.path.join(SCRIPT_DIR, "returns_stats.xlsx")
+    if not os.path.exists(path):
+        return {}
+    try:
+        df = pd.read_excel(path, sheet_name="CAPM Returns")
+        return dict(zip(df["Ticker"], df["CAPM_Expected_Return"]))
+    except Exception:
+        return {}
 
 
 def load_portfolio_options():
@@ -137,7 +219,7 @@ def fetch_ticker_info(ticker):
     """Returns (company_name, country). Cached 1 hour."""
     try:
         import yfinance as yf
-        info = yf.Ticker(ticker).info
+        info = fetch_with_retry(lambda: yf.Ticker(ticker).info)
         name = info.get("longName") or info.get("shortName") or ticker
         country = info.get("country") or "N/A"
         return name, country
@@ -150,24 +232,25 @@ def fetch_ticker_sector(ticker):
     """Returns sector string or None. Cached 1 hour."""
     try:
         import yfinance as yf
-        return yf.Ticker(ticker).info.get("sector") or None
+        info = fetch_with_retry(lambda: yf.Ticker(ticker).info)
+        return info.get("sector") or None
     except Exception:
         return None
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_ticker_pe(ticker):
-    """Returns trailingPE, then forwardPE, then None. Cached 1 hour."""
+    """Returns forwardPE first, falls back to trailingPE, then None. Cached 1 hour."""
     try:
         import yfinance as yf
-        info = yf.Ticker(ticker).info
-        pe = info.get("trailingPE")
-        if pe is None or (isinstance(pe, float) and (pe != pe)):  # None or NaN
-            pe = info.get("forwardPE")
-        if pe is None or (isinstance(pe, float) and (pe != pe)):
+        info = fetch_with_retry(lambda: yf.Ticker(ticker).info)
+        pe = info.get("forwardPE")
+        if pe is None or (isinstance(pe, float) and pe != pe):
+            pe = info.get("trailingPE")
+        if pe is None or (isinstance(pe, float) and pe != pe):
             return None
         pe = float(pe)
-        return pe if pe > 0 else None  # negative P/E is not meaningful
+        return pe if pe > 0 else None
     except Exception:
         return None
 
@@ -219,7 +302,7 @@ def fetch_benchmark_returns():
     for label, sym in [("S&P 500", "^GSPC"), ("Nifty 50", "^NSEI")]:
         try:
             import yfinance as yf
-            hist = yf.Ticker(sym).history(period="2y")
+            hist = fetch_with_retry(lambda s=sym: yf.Ticker(s).history(period="2y"))
             if hist.empty or len(hist) < 2:
                 out[label] = None
                 continue
@@ -269,27 +352,79 @@ st.divider()
 _ccy = st.selectbox("**Currency**", ["USD — US Dollar", "INR — Indian Rupee"])
 selected_currency = "INR" if "INR" in _ccy else "USD"
 
+# ── Market filter ─────────────────────────────────────────────────────────────
+_company_df = load_company_list()
+
+st.markdown("**Market**")
+_mc1, _mc2 = st.columns(2)
+with _mc1:
+    if st.button(
+        "USA",
+        key="btn_mkt_usa",
+        use_container_width=True,
+        type="primary" if st.session_state.mkt_active == "USA" else "secondary",
+    ):
+        st.session_state.mkt_active = "USA"
+        st.rerun()
+with _mc2:
+    if st.button(
+        "India",
+        key="btn_mkt_india",
+        use_container_width=True,
+        type="primary" if st.session_state.mkt_active == "India" else "secondary",
+    ):
+        st.session_state.mkt_active = "India"
+        st.rerun()
+_mkt_filter = st.session_state.mkt_active
+
 st.markdown("**Your holdings**")
 
 for i, h in enumerate(list(st.session_state.holdings)):
     c1, c2, c3 = st.columns([3, 2, 1])
     with c1:
-        t_val = st.text_input(
-            f"Ticker {i+1}", value=h["ticker"],
-            key=f"t_{i}", placeholder="e.g. AAPL, RELIANCE.NS",
-            label_visibility="collapsed" if i > 0 else "visible",
+        if i == 0:
+            st.markdown("**Ticker**")
+        # Search text input (doubles as direct ticker entry when no match)
+        query = st.text_input(
+            f"_hsearch_{i}",
+            key=f"hsearch_{i}",
+            placeholder="Type company name or ticker e.g. Apple or AAPL",
+            label_visibility="collapsed",
         )
-        st.session_state.holdings[i]["ticker"] = t_val.strip().upper()
+        opts = _filter_options(query, _company_df, _mkt_filter) if _company_df is not None else []
+        if opts:
+            _no_sel = "— select company —"
+            _qkey   = (query or "").strip().lower()[:30]
+            _sel = st.selectbox(
+                f"_hsel_{i}",
+                options=[_no_sel] + opts,
+                index=0,
+                key=f"hsel_{i}_{_qkey}",
+                label_visibility="collapsed",
+            )
+            _extracted = _extract_ticker(_sel)
+            if _extracted:
+                st.session_state.holdings[i]["ticker"] = _extracted
+            elif not st.session_state.holdings[i]["ticker"] and query:
+                st.session_state.holdings[i]["ticker"] = query.strip().upper()
+        elif query and query.strip():
+            # No dropdown matches — accept typed text as direct ticker
+            st.session_state.holdings[i]["ticker"] = query.strip().upper()
+        # Confirmation caption
+        if st.session_state.holdings[i]["ticker"]:
+            st.caption(f"Selected: {st.session_state.holdings[i]['ticker']}")
     with c2:
+        if i == 0:
+            st.markdown("**Shares**")
         s_val = st.number_input(
             f"Shares {i+1}", value=int(h["shares"]),
             min_value=0, step=1, key=f"s_{i}",
-            label_visibility="collapsed" if i > 0 else "visible",
+            label_visibility="collapsed",
         )
         st.session_state.holdings[i]["shares"] = s_val
     with c3:
         if i == 0:
-            st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
+            st.markdown("<div style='height:56px'></div>", unsafe_allow_html=True)
         if i > 0 and st.button("Remove", key=f"rm_{i}"):
             st.session_state.holdings.pop(i)
             st.rerun()
@@ -324,12 +459,32 @@ if st.session_state.new_positions:
 for i, np_h in enumerate(list(st.session_state.new_positions)):
     nc1, nc2, nc3 = st.columns([3, 2, 1])
     with nc1:
-        np_val = st.text_input(
-            f"New Ticker {i+1}", value=np_h["ticker"],
-            key=f"np_t_{i}", placeholder="e.g. NVDA, INFY.NS",
+        np_query = st.text_input(
+            f"_npsearch_{i}",
+            key=f"npsearch_{i}",
+            placeholder="Type company name or ticker e.g. NVDA, INFY.NS",
             label_visibility="collapsed",
         )
-        st.session_state.new_positions[i]["ticker"] = np_val.strip().upper()
+        np_opts = _filter_options(np_query, _company_df, _mkt_filter) if _company_df is not None else []
+        if np_opts:
+            _np_no_sel = "— select company —"
+            _np_qkey   = (np_query or "").strip().lower()[:30]
+            _np_sel = st.selectbox(
+                f"_npsel_{i}",
+                options=[_np_no_sel] + np_opts,
+                index=0,
+                key=f"npsel_{i}_{_np_qkey}",
+                label_visibility="collapsed",
+            )
+            _np_extracted = _extract_ticker(_np_sel)
+            if _np_extracted:
+                st.session_state.new_positions[i]["ticker"] = _np_extracted
+            elif not st.session_state.new_positions[i]["ticker"] and np_query:
+                st.session_state.new_positions[i]["ticker"] = np_query.strip().upper()
+        elif np_query and np_query.strip():
+            st.session_state.new_positions[i]["ticker"] = np_query.strip().upper()
+        if st.session_state.new_positions[i]["ticker"]:
+            st.caption(f"Selected: {st.session_state.new_positions[i]['ticker']}")
     with nc2:
         st.markdown(
             "<div style='padding-top:8px;color:#4A5568;font-style:italic;"
@@ -371,12 +526,14 @@ if st.button("Run Optimization", use_container_width=True,
     tickers      = [h["ticker"] for h in _filled] + [h["ticker"] for h in _new_filled]
     all_holdings = _filled + [{"ticker": h["ticker"], "shares": 0.0} for h in _new_filled]
     try:
-        with st.spinner("Fetching prices and optimizing — this takes about 30 seconds..."):
+        with st.spinner("Fetching latest prices... (this takes about 30 seconds)"):
             write_config(tickers, selected_currency)
             run_module("module0_riskfree.py", timeout=60)
+        with st.spinner("Calculating optimal weights..."):
             run_module("module1_data.py", timeout=300)
             run_module("module2_optimiser.py", timeout=180)
             run_module("module3_frontier.py", timeout=180)
+        with st.spinner("Generating your rebalancing plan..."):
             instrs, positions, total_usd, usd_inr, bad, xl_path = run_rebalancing(
                 all_holdings, selected_currency, selected_target
             )
@@ -386,19 +543,17 @@ if st.button("Run Optimization", use_container_width=True,
             currency=selected_currency, target=selected_target,
             new_tickers=_new_tickers_set,
         )
-    except RuntimeError as e:
-        st.session_state.error = str(e)
-    except Exception as e:
-        st.session_state.error = f"{type(e).__name__}: {str(e)[:400]}"
+    except Exception:
+        st.session_state.error = True
 
 if not _can_run:
     st.caption("Enter at least 3 tickers to run.")
 
 if st.session_state.error:
     st.error(
-        "**Something went wrong.** "
-        + st.session_state.error
-        + "\n\nCheck your ticker symbols and internet connection, then try again."
+        "Some data could not be fetched. Please tap **Run Optimization** again. "
+        "If the problem persists, check that your tickers are valid and your "
+        "internet connection is stable."
     )
 
 
@@ -550,6 +705,7 @@ if st.session_state.results:
     # ── Feature 3 — Portfolio Health Score ───────────────────────────────────
     st.markdown("---")
     st.subheader("Portfolio Health Score")
+    _hs_msg = st.info("Building your health score...", icon="⏳")
 
     try:
         _countries            = set()
@@ -641,7 +797,7 @@ if st.session_state.results:
         # Factor 3 — Valuation: Weighted P/E (max 2.0)
         try:
             _pe_india_only = "India" in _countries and "United States" not in _countries
-            _pe_benchmark  = 20.0 if _pe_india_only else 18.0
+            _pe_benchmark  = IMPLIED_PE_INDIA if _pe_india_only else IMPLIED_PE_USA
             _pe_bench_name = "Nifty 50" if _pe_india_only else "S&P 500"
 
             if _pe_total_count == 0 or len(_pe_missing_tks) > _pe_total_count / 2:
@@ -740,6 +896,7 @@ if st.session_state.results:
         elif _total_score >= 4.0: _rating = "Needs Attention"
         else:                     _rating = "Poor"
 
+        _hs_msg.empty()   # clear "Building..." message now that score is ready
         _progress_pct = min(_total_score / 10 * 100, 100)
         st.markdown(
             f'<div class="health-score-container" aria-live="polite">'
@@ -768,6 +925,7 @@ if st.session_state.results:
         ), unsafe_allow_html=True)
 
     except Exception as _e:
+        _hs_msg.empty()
         st.warning(f"Health score could not be calculated: {_e}")
 
     # ── TABLE 2 — Adjusted Weight Portfolio ───────────────────────────────────
@@ -852,6 +1010,7 @@ if st.session_state.results:
     # ── TABLE 3B — Optimized Portfolio ────────────────────────────────────────
     st.subheader(f"Optimized Portfolio — {target}")
 
+    capm_returns = load_capm_returns()
     final_shares = {t: pos["shares"] for t, pos in positions.items()}
     for inst in instrs:
         if "Skipped" in inst["status"]:
@@ -882,6 +1041,7 @@ if st.session_state.results:
         total_final_usd += value_usd
 
     t3b_rows, t3b_classes = [], []
+    _port_ret_num, _port_ret_den = 0.0, 0.0   # for Portfolio Summary
     for ticker in sorted(final_shares.keys()):
         shares = final_shares[ticker]
         if shares <= 0:
@@ -892,18 +1052,55 @@ if st.session_state.results:
         value_usd = (shares * price_native / usd_inr) if is_indian else (shares * price_native)
         weight    = (value_usd / total_final_usd * 100) if total_final_usd > 0 else 0
         name, _   = fetch_ticker_info(ticker)
-        t3b_rows.append([ticker, name, f"{shares:g}", f"{weight:.1f}%",
+        capm_ret  = capm_returns.get(ticker)
+        capm_str  = f"{capm_ret*100:.2f}%" if capm_ret is not None else "N/A"
+        if capm_ret is not None:
+            _port_ret_num += (weight / 100) * capm_ret
+            _port_ret_den += weight / 100
+        t3b_rows.append([ticker, name, f"{shares:g}", f"{weight:.1f}%", capm_str,
                           fmt_val(value_usd, currency, usd_inr)])
         t3b_classes.append("")
 
-    t3b_rows.append(["TOTAL", "", "", "100.0%", fmt_val(total_final_usd, currency, usd_inr)])
+    t3b_rows.append(["TOTAL", "", "", "100.0%", "", fmt_val(total_final_usd, currency, usd_inr)])
     t3b_classes.append("total")
 
     st.markdown(render_table(
         "Your portfolio after all trades in the Action Table above are executed.",
-        ["Ticker", "Company", "Units", "Weight", f"Value ({currency})"],
+        ["Ticker", "Company", "Units", "Weight", "Expected Return", f"Value ({currency})"],
         t3b_rows, t3b_classes,
     ), unsafe_allow_html=True)
+
+    # ── Portfolio Summary (Upgrade 7) ─────────────────────────────────────────
+    try:
+        # Detect portfolio market: all .NS → India, otherwise USA
+        _3b_tickers = [t for t, s in final_shares.items() if s > 0]
+        _all_india   = bool(_3b_tickers) and all(t.upper().endswith(".NS") for t in _3b_tickers)
+        _rf          = RF_INDIA if _all_india else load_risk_free_rate()
+        _vol = None
+        try:
+            _opt_df = pd.read_excel(
+                os.path.join(SCRIPT_DIR, "optimised_portfolios.xlsx"),
+                sheet_name=target,
+            )
+            for _, _row in _opt_df.iterrows():
+                if "Volatility" in str(_row.get("Stock", "")):
+                    _vol = float(_row.get("Weight (%)", 0)) / 100.0
+                    break
+        except Exception:
+            pass
+
+        if _port_ret_den > 0:
+            # _port_ret_num = sum(weight_frac_i * capm_i) for tickers with CAPM data
+            # Rescale by _port_ret_den so missing tickers don't deflate the result
+            _port_ret = _port_ret_num / _port_ret_den
+
+            st.markdown("**Portfolio Summary** *(based on CAPM)*")
+            st.markdown(f"- **Portfolio Expected Return:** {_port_ret*100:.2f}%")
+            if _vol is not None and _vol > 0:
+                _sharpe = (_port_ret - _rf) / _vol
+                st.markdown(f"- **Portfolio Sharpe Ratio:** {_sharpe:.2f}")
+    except Exception:
+        pass
 
     # ── Download ──────────────────────────────────────────────────────────────
     xl = R["xl_path"]

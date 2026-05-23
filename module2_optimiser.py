@@ -29,8 +29,17 @@ warnings.filterwarnings("ignore")
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 TRADING_DAYS = 252
-MAX_WEIGHT   = 0.40     # 40 % single-stock cap
 SCRIPT_DIR   = os.path.dirname(os.path.abspath(__file__))
+
+
+def get_adaptive_bounds(n):
+    """Return (min_weight, max_weight) based on number of stocks."""
+    if n == 3:
+        return 0.05, 0.60
+    elif n <= 6:
+        return 0.03, 0.35
+    else:
+        return 0.02, 0.20
 
 
 def _load_risk_free_rate(fallback=0.043):
@@ -89,7 +98,8 @@ def optimise(objective, mu, cov, label):
     Returns (weights_array, success_bool, message_str).
     """
     n = len(mu)
-    bounds      = [(0.0, MAX_WEIGHT)] * n
+    w_min, w_max = get_adaptive_bounds(n)
+    bounds      = [(w_min, w_max)] * n
     constraints = [{"type": "eq", "fun": lambda w: np.sum(w) - 1.0}]
 
     # Try several random starting points; keep best result
@@ -97,9 +107,9 @@ def optimise(objective, mu, cov, label):
     rng = np.random.default_rng(seed=42)
 
     for attempt in range(50):
-        # Random Dirichlet start, then clip to MAX_WEIGHT and renormalise
+        # Random Dirichlet start, then clip to bounds and renormalise
         w0 = rng.dirichlet(np.ones(n))
-        w0 = np.clip(w0, 0, MAX_WEIGHT)
+        w0 = np.clip(w0, w_min, w_max)
         w0 /= w0.sum()
 
         res = minimize(
@@ -119,8 +129,8 @@ def optimise(objective, mu, cov, label):
     if best_result is None or not (best_result.success or best_result.status == 0):
         return None, False, f"Optimisation did not converge for '{label}'"
 
-    weights = np.clip(best_result.x, 0, None)
-    weights /= weights.sum()   # re-normalise after clipping tiny negatives
+    weights = np.clip(best_result.x, w_min, w_max)
+    weights /= weights.sum()   # re-normalise after clipping
     return weights, True, "OK"
 
 
@@ -257,18 +267,32 @@ def main():
         print(f"    {t:<22} {r*100:>7.2f}%")
 
     # ── 3. Feasibility check ───────────────────────────────────────────────────
-    # With MAX_WEIGHT = 0.40, we need at least ceil(1/0.40) = 3 stocks.
-    min_stocks = int(np.ceil(1.0 / MAX_WEIGHT))
+    w_min, w_max = get_adaptive_bounds(n)
+    min_stocks = int(np.ceil(1.0 / w_max))
     if n < min_stocks:
-        print(f"\n  ERROR: Need at least {min_stocks} stocks to satisfy the "
-              f"{MAX_WEIGHT*100:.0f}% cap constraint. Only {n} available.")
+        print(f"\n  ERROR: Need at least {min_stocks} stocks for the "
+              f"{w_max*100:.0f}% cap (adaptive, n={n}). Only {n} available.")
         sys.exit(1)
+    print(f"\n  Adaptive bounds for n={n}: min={w_min*100:.0f}%  max={w_max*100:.0f}%")
+
+    # ── 3b. Load CAPM returns for Max Return strategy ─────────────────────────
+    capm_mu = mu.copy()   # default: fall back to momentum if CAPM unavailable
+    try:
+        capm_df  = pd.read_excel(returns_path, sheet_name="CAPM Returns")
+        capm_map = dict(zip(capm_df["Ticker"], capm_df["CAPM_Expected_Return"]))
+        capm_mu  = np.array([capm_map.get(t, mu[i]) for i, t in enumerate(tickers)])
+        print(f"  CAPM returns loaded for Max Return strategy.")
+        for t, r in zip(tickers, capm_mu):
+            print(f"    {t:<22} {r*100:>7.2f}%  (CAPM)")
+    except Exception as exc:
+        print(f"  WARNING: Could not load CAPM Returns sheet ({exc}). "
+              "Using momentum returns for all strategies.")
 
     # ── 4. Run optimisations ───────────────────────────────────────────────────
     configs = [
-        ("1 — Maximum Sharpe Ratio", neg_sharpe),
-        ("2 — Minimum Volatility",   portfolio_vol),
-        ("3 — Maximum Return",       neg_return),
+        ("1 — Maximum Sharpe Ratio", neg_sharpe,    mu),
+        ("2 — Minimum Volatility",   portfolio_vol, mu),
+        ("3 — Maximum Return",       neg_return,    capm_mu),   # CAPM here
     ]
 
     sheet_names = [
@@ -279,18 +303,18 @@ def main():
 
     portfolios = []   # (sheet_name, result_df)
 
-    for (label, obj_fn), sheet in zip(configs, sheet_names):
+    for (label, obj_fn, mu_for_opt), sheet in zip(configs, sheet_names):
         print(f"\n  Optimising: {label} ...", end=" ", flush=True)
-        weights, success, msg = optimise(obj_fn, mu, cov, label)
+        weights, success, msg = optimise(obj_fn, mu_for_opt, cov, label)
 
         if not success:
             print(f"\n  WARNING: {msg}")
             continue
 
         print("done.")
-        print_portfolio(label, tickers, weights, mu, cov)
+        print_portfolio(label, tickers, weights, mu_for_opt, cov)
 
-        result_df, _, _, _ = build_result_df(tickers, weights, mu, cov)
+        result_df, _, _, _ = build_result_df(tickers, weights, mu_for_opt, cov)
         portfolios.append((sheet, result_df))
 
     if not portfolios:

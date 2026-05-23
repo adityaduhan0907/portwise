@@ -23,7 +23,9 @@ OUTPUTS
 """
 
 import json
+import math
 import os
+import time
 import warnings
 from datetime import date
 
@@ -42,6 +44,12 @@ SKIP_RECENT       = 1      # months to skip at near end (short-term reversal)
 MOM_WINDOW        = 11     # holding-period months = 12 − 1
 MIN_DATA_FRAC     = 0.70
 SCRIPT_DIR        = os.path.dirname(os.path.abspath(__file__))
+
+# ── Market constants ────────────────────────────────────────────────────────────
+ERP_USA   = 0.058093   # US Equity Risk Premium
+ERP_INDIA = 0.0750     # India Equity Risk Premium
+RF_INDIA  = 0.0675     # India risk-free rate (10Y G-Sec, hardcoded)
+CAPM_ERP  = ERP_USA    # backward-compat alias
 
 
 def _load_risk_free_rate(fallback=0.043):
@@ -202,6 +210,53 @@ def annualised_stats_split(mom_return, longrun_monthly_returns):
     }
 
 
+# ── CAPM expected returns ──────────────────────────────────────────────────────
+
+def calculate_capm_returns(tickers, rf_usa):
+    """
+    Fetch beta for each ticker (3 retries, fallback beta=1.0) and compute
+    CAPM expected return using per-market constants:
+
+      India (.NS): E[r] = RF_INDIA + beta × ERP_INDIA
+      USA  (else): E[r] = rf_usa   + beta × ERP_USA
+
+    Returns dict {ticker: {"beta", "market", "rf", "erp", "expected_return"}}
+    """
+    results = {}
+    for ticker in tickers:
+        is_india = ticker.upper().endswith(".NS")
+        rf  = RF_INDIA  if is_india else rf_usa
+        erp = ERP_INDIA if is_india else ERP_USA
+
+        beta = None
+        for attempt in range(3):
+            try:
+                info = yf.Ticker(ticker).info
+                raw  = info.get("beta")
+                if raw is not None:
+                    candidate = float(raw)
+                    if not math.isnan(candidate):
+                        beta = candidate
+                        break
+            except Exception:
+                pass
+            if attempt < 2:
+                time.sleep(1)
+
+        if beta is None:
+            print(f"  WARNING: Beta not available for {ticker}. Using market beta of 1.0")
+            beta = 1.0
+
+        results[ticker] = {
+            "beta":            beta,
+            "market":          "India" if is_india else "USA",
+            "rf":              rf,
+            "erp":             erp,
+            "expected_return": rf + beta * erp,
+        }
+    return results
+
+
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def main():
@@ -279,8 +334,8 @@ def main():
         else:
             min_cov = int(LONGRUN_YEARS * TRADING_MONTHS * MIN_DATA_FRAC)
             if len(cov_s) < min_cov:
-                print(f"    Long-run   : WARNING -- only {len(cov_s)} monthly prices "
-                      f"(need ~{min_cov} for full {LONGRUN_YEARS}y); using all available")
+                print(f"  WARNING: {symbol} only has {len(cov_s)} months of data. "
+                      f"Using full available history.")
             else:
                 print(f"    Long-run   : {len(cov_s):>4} monthly prices  OK")
             cov_prices[symbol] = cov_s
@@ -357,7 +412,29 @@ def main():
 
     corr_df = cov_clean.corr() if not cov_clean.empty else returns_df[cov_cols].corr()
 
-    # ── 6. Prepare Annualised Mu and Cov for export ───────────────────────────
+    # ── 6. CAPM expected returns ───────────────────────────────────────────────
+    print(f"\n{'='*W}")
+    print(f"  CAPM EXPECTED RETURNS  (USA ERP={ERP_USA*100:.4f}%, India ERP={ERP_INDIA*100:.4f}%)")
+    print(f"{'='*W}")
+    capm_results = calculate_capm_returns(common, RISK_FREE_RATE)
+    for s, v in capm_results.items():
+        print(f"    {s:<22}  [{v['market']:5}]  beta={v['beta']:.3f}  "
+              f"Rf={v['rf']*100:.2f}%  ERP={v['erp']*100:.2f}%  "
+              f"E[r]={v['expected_return']*100:>7.2f}%")
+
+    capm_df = pd.DataFrame([
+        {
+            "Ticker":               t,
+            "Market":               v["market"],
+            "Beta":                 round(v["beta"], 4),
+            "CAPM_Expected_Return": round(v["expected_return"], 6),
+            "Rf":                   round(v["rf"], 6),
+            "ERP":                  round(v["erp"], 6),
+        }
+        for t, v in capm_results.items()
+    ])
+
+    # ── 7. Prepare Annualised Mu and Cov for export ───────────────────────────
     mu_series  = pd.Series({s: mu_dict[s] for s in common}, name="Annualised_Expected_Return")
     mu_series.index.name = "Ticker"
     cov_export = cov_matrix.loc[common, common]
@@ -449,10 +526,13 @@ def main():
         # Sheet 6: Annualised Cov  (module2 / module3 source)
         cov_export.to_excel(writer, sheet_name="Annualised Cov")
 
+        # Sheet 7: CAPM Returns  (app.py reads this for Table 3B)
+        capm_df.to_excel(writer, sheet_name="CAPM Returns", index=False)
+
     print(f"  Exported -> {prices_path}")
     print(f"  Exported -> {returns_path}")
     print( "    Sheets : Daily Returns | Momentum Returns | LongRun Monthly Returns")
-    print( "             Stats & Correlation | Annualised Mu | Annualised Cov")
+    print( "             Stats & Correlation | Annualised Mu | Annualised Cov | CAPM Returns")
 
     # ── 9. Summary ─────────────────────────────────────────────────────────────
     print(f"\n{'='*W}")

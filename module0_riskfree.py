@@ -17,6 +17,7 @@ so module1, module2, and module3 can read from one shared source of truth.
 import json
 import os
 import sys
+import time
 import warnings
 from datetime import datetime
 
@@ -63,20 +64,24 @@ PORTFOLIO_TICKERS = _load_portfolio_tickers()
 
 # ── Fetch helpers ──────────────────────────────────────────────────────────────
 
-def fetch_latest_close(symbol, lookback="10d"):
+def fetch_latest_close(symbol, lookback="10d", max_retries=3, delay=2):
     """
     Return the most recent closing value for a yfinance ticker, or None on
-    any failure (no data, HTTP error, empty frame, etc.).
+    any failure (no data, HTTP error, empty frame, etc.).  Retries up to
+    max_retries times before giving up.
     """
-    try:
-        hist = yf.Ticker(symbol).history(period=lookback, auto_adjust=True)
-        if isinstance(hist.columns, object) and "Close" in hist.columns:
-            close = hist["Close"].dropna()
-            if not close.empty:
-                return float(close.iloc[-1])
-        return None
-    except Exception:
-        return None
+    for attempt in range(max_retries):
+        try:
+            hist = yf.Ticker(symbol).history(period=lookback, auto_adjust=True)
+            if isinstance(hist.columns, object) and "Close" in hist.columns:
+                close = hist["Close"].dropna()
+                if not close.empty:
+                    return float(close.iloc[-1])
+            return None
+        except Exception:
+            if attempt < max_retries - 1:
+                time.sleep(delay)
+    return None
 
 
 def fetch_us_rate():

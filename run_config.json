@@ -1,12 +1,1 @@
-{
-  "tickers": [
-    "INTC",
-    "MU",
-    "PLTR",
-    "SNOW",
-    "TSLA"
-  ],
-  "currency": "USD",
-  "holdings": [],
-  "created_at": "2026-05-18 13:38:35"
-}
+{"tickers": ["RELIANCE.NS", "HDFCBANK.NS", "INFY.NS"], "currency": "INR", "holdings": []}

@@ -25,6 +25,7 @@ Run order: module0 -> module1 -> module2 -> module3 -> module4
 
 import os
 import sys
+import time
 import warnings
 from datetime import datetime
 
@@ -183,22 +184,26 @@ def is_indian(ticker):
 
 def fetch_usd_inr_rate():
     """
-    Fetch the live USD/INR spot rate via yfinance (USDINR=X).
-    Falls back to manual input if the fetch fails.
+    Fetch the live USD/INR spot rate via yfinance (USDINR=X), with up to
+    3 retries.  Falls back to manual input if all attempts fail.
 
     Returns
     -------
     float  — number of INR per USD  (e.g. 95.95)
     """
     print("  Fetching live USD/INR rate (USDINR=X) ...", end=" ", flush=True)
-    try:
-        hist = yf.Ticker("USDINR=X").history(period="3d")
-        if not hist.empty:
-            rate = float(hist["Close"].iloc[-1])
-            print(f"{rate:.4f} INR/USD")
-            return rate
-    except Exception as exc:
-        print(f"failed ({exc})")
+    for attempt in range(3):
+        try:
+            hist = yf.Ticker("USDINR=X").history(period="3d")
+            if not hist.empty:
+                rate = float(hist["Close"].iloc[-1])
+                print(f"{rate:.4f} INR/USD")
+                return rate
+        except Exception as exc:
+            if attempt < 2:
+                time.sleep(2)
+            else:
+                print(f"failed ({exc})")
 
     # Manual fallback if yfinance cannot retrieve the rate
     print("  Could not fetch the exchange rate automatically.")
