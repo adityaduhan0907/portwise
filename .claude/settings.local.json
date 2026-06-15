@@ -6,7 +6,11 @@
       "Bash(git --no-pager diff -- module1_data.py)",
       "Bash(python module1_data.py)",
       "Bash(echo \"exit=$?\")",
-      "Read(//tmp/**)"
+      "Read(//tmp/**)",
+      "Bash(mv -f run_config.json.bak run_config.json)",
+      "Bash(python module0_riskfree.py)",
+      "Bash(python module2_optimiser.py)",
+      "Bash(git --no-pager diff -- module2_optimiser.py)"
     ]
   }
 }
