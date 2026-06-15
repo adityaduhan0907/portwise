@@ -1,19 +1,28 @@
 #!/usr/bin/env python3
 """
-module2_optimiser.py
+module2_optimiser.py  —  Layer 3 Core Optimizer
 
-Reads prices.xlsx and returns_stats.xlsx produced by module1_data.py,
-then runs mean-variance optimisation to find three portfolios:
-  1. Maximum Sharpe Ratio
-  2. Minimum Volatility
-  3. Maximum Return
+Reads returns_stats.xlsx produced by module1_data.py, then builds three goals:
 
-Constraints (retail investor):
-  - No short selling  (weights >= 0)
-  - Full investment   (sum of weights == 1)
-  - Max 40% per stock (weights <= 0.40)
+  1. Minimum Variance (GMV) — minimise wᵀ·Σ·w on module 1's covariance
+     (Ledoit-Wolf / factor-decomposition "Annualised Cov"). Constraints:
+     w >= 0, sum to 1, NO concentration caps (the naturally diversified
+     baseline). Ignores expected returns.
 
-Exports results to optimised_portfolios.xlsx.
+  2. Maximum Risk-Adjusted Return — maximise the Sharpe ratio
+     (wᵀ·mu - rf) / sqrt(wᵀ·Σ·w) using the FACTOR expected returns
+     (FF3-US / Carhart4-India, "CAPM Returns" sheet), the same Σ, and
+     rf = blended_rate. Constraints: w >= 0, sum to 1, PLUS adaptive weight
+     caps (3 stocks 60% / 4-6 35% / 7-15 20%) to prevent concentration.
+
+  3. Tail-Risk Minimization — handled by Layer 6 (CVaR), which needs the
+     Layer 4 simulation. Neither exists yet, so this is a clean STUB.
+
+Momentum mu (module 1) is still loaded/displayed but is no longer used by any
+optimiser goal.
+
+Exports goals 1-2 to optimised_portfolios.xlsx (same weight/stats layout as
+before, new goal sheet names).
 """
 
 import json
@@ -86,19 +95,17 @@ def portfolio_vol(weights, mu, cov):
     return float(np.sqrt(weights @ cov @ weights))
 
 
-def neg_return(weights, mu, cov):
-    return -float(weights @ mu)
-
-
 # ── Core optimiser ─────────────────────────────────────────────────────────────
 
-def optimise(objective, mu, cov, label):
+def optimise(objective, mu, cov, label, w_min, w_max):
     """
-    Run SLSQP minimisation.
+    Run SLSQP minimisation with explicit per-asset bounds.
+      w_min/w_max : lower / upper weight bound applied to every asset.
+        - GMV (goal 1)            -> (0.0, 1.0)  (no concentration caps)
+        - Max Risk-Adjusted (g.2) -> (0.0, adaptive cap)  (caps, no min floor)
     Returns (weights_array, success_bool, message_str).
     """
     n = len(mu)
-    w_min, w_max = get_adaptive_bounds(n)
     bounds      = [(w_min, w_max)] * n
     constraints = [{"type": "eq", "fun": lambda w: np.sum(w) - 1.0}]
 
@@ -213,7 +220,8 @@ def export_to_excel(portfolios, out_path):
 
 def main():
     print(f"\n{'='*62}")
-    print("  Module 2 — Mean-Variance Portfolio Optimiser")
+    print("  Module 2 — Layer 3 Core Optimizer")
+    print("  Goals: Min Variance (GMV) | Max Risk-Adjusted | Tail-Risk (stub)")
     print(f"{'='*62}\n")
 
     # ── 1. Load pre-computed mu and covariance from module1 ───────────────────
@@ -266,56 +274,75 @@ def main():
     for t, r in zip(tickers, mu):
         print(f"    {t:<22} {r*100:>7.2f}%")
 
-    # ── 3. Feasibility check ───────────────────────────────────────────────────
-    w_min, w_max = get_adaptive_bounds(n)
-    min_stocks = int(np.ceil(1.0 / w_max))
+    # ── 3. Feasibility check (for goal 2's adaptive cap) ──────────────────────
+    _, w_cap = get_adaptive_bounds(n)
+    min_stocks = int(np.ceil(1.0 / w_cap))
     if n < min_stocks:
         print(f"\n  ERROR: Need at least {min_stocks} stocks for the "
-              f"{w_max*100:.0f}% cap (adaptive, n={n}). Only {n} available.")
+              f"{w_cap*100:.0f}% cap (adaptive, n={n}). Only {n} available.")
         sys.exit(1)
-    print(f"\n  Adaptive bounds for n={n}: min={w_min*100:.0f}%  max={w_max*100:.0f}%")
+    print(f"\n  Goal 1 (GMV) bounds : 0%..100% (no caps)")
+    print(f"  Goal 2 cap (n={n})    : 0%..{w_cap*100:.0f}% (adaptive)")
 
-    # ── 3b. Load CAPM returns for Max Return strategy ─────────────────────────
-    capm_mu = mu.copy()   # default: fall back to momentum if CAPM unavailable
+    # ── 3b. Load FACTOR returns for the Max Risk-Adjusted goal ────────────────
+    #        (FF3-US / Carhart4-India model, written by module 1 as "CAPM Returns".)
+    capm_mu = mu.copy()   # default: fall back to momentum if factor mu unavailable
     try:
         capm_df  = pd.read_excel(returns_path, sheet_name="CAPM Returns")
         capm_map = dict(zip(capm_df["Ticker"], capm_df["CAPM_Expected_Return"]))
         capm_mu  = np.array([capm_map.get(t, mu[i]) for i, t in enumerate(tickers)])
-        print(f"  CAPM returns loaded for Max Return strategy.")
+        print(f"  Factor returns loaded for the Max Risk-Adjusted goal.")
         for t, r in zip(tickers, capm_mu):
-            print(f"    {t:<22} {r*100:>7.2f}%  (CAPM)")
+            print(f"    {t:<22} {r*100:>7.2f}%  (factor)")
     except Exception as exc:
         print(f"  WARNING: Could not load CAPM Returns sheet ({exc}). "
-              "Using momentum returns for all strategies.")
+              "Max Risk-Adjusted will fall back to momentum returns.")
 
-    # ── 4. Run optimisations ───────────────────────────────────────────────────
-    configs = [
-        ("1 — Maximum Sharpe Ratio", neg_sharpe,    mu),
-        ("2 — Minimum Volatility",   portfolio_vol, mu),
-        ("3 — Maximum Return",       neg_return,    capm_mu),   # CAPM here
-    ]
-
-    sheet_names = [
-        "Max Sharpe Ratio",
-        "Min Volatility",
-        "Max Return",
-    ]
-
+    # ── 4. Run the three Layer 3 goals ─────────────────────────────────────────
     portfolios = []   # (sheet_name, result_df)
 
-    for (label, obj_fn, mu_for_opt), sheet in zip(configs, sheet_names):
-        print(f"\n  Optimising: {label} ...", end=" ", flush=True)
-        weights, success, msg = optimise(obj_fn, mu_for_opt, cov, label)
-
-        if not success:
-            print(f"\n  WARNING: {msg}")
-            continue
-
+    # Goal 1 — Minimum Variance (GMV): minimise wᵀΣw, w>=0, sum=1, NO caps.
+    #          Objective ignores returns; momentum mu is passed for display only.
+    label_gmv = "1 — Minimum Variance (GMV)"
+    print(f"\n  Optimising: {label_gmv} ...  (no concentration caps)", end=" ", flush=True)
+    w_gmv, ok_gmv, msg_gmv = optimise(portfolio_vol, mu, cov, label_gmv,
+                                      w_min=0.0, w_max=1.0)
+    if ok_gmv:
         print("done.")
-        print_portfolio(label, tickers, weights, mu_for_opt, cov)
+        print_portfolio(label_gmv, tickers, w_gmv, mu, cov)
+        df_gmv, _, _, _ = build_result_df(tickers, w_gmv, mu, cov)
+        portfolios.append(("Minimum Variance", df_gmv))
+    else:
+        print(f"\n  WARNING: {msg_gmv}")
 
-        result_df, _, _, _ = build_result_df(tickers, weights, mu_for_opt, cov)
-        portfolios.append((sheet, result_df))
+    # Goal 2 — Maximum Risk-Adjusted Return: maximise Sharpe with the FACTOR mu
+    #          (capm_mu), same Σ, rf=blended_rate, PLUS adaptive caps (no min floor).
+    adaptive_cap = get_adaptive_bounds(n)[1]   # max only: 60% / 35% / 20%
+    label_rar = "2 — Maximum Risk-Adjusted Return"
+    print(f"\n  Optimising: {label_rar} ...  (adaptive cap {adaptive_cap*100:.0f}%, "
+          f"factor mu)", end=" ", flush=True)
+    w_rar, ok_rar, msg_rar = optimise(neg_sharpe, capm_mu, cov, label_rar,
+                                      w_min=0.0, w_max=adaptive_cap)
+    if ok_rar:
+        print("done.")
+        print_portfolio(label_rar, tickers, w_rar, capm_mu, cov)
+        max_w = float(np.max(w_rar))
+        print(f"  Cap check              : max weight {max_w*100:.2f}% "
+              f"<= {adaptive_cap*100:.0f}%  -> {'OK' if max_w <= adaptive_cap + 1e-6 else 'VIOLATED'}")
+        df_rar, _, _, _ = build_result_df(tickers, w_rar, capm_mu, cov)
+        portfolios.append(("Max Risk-Adjusted", df_rar))
+    else:
+        print(f"\n  WARNING: {msg_rar}")
+
+    # Goal 3 — Tail-Risk Minimization: STUB. Needs Layer 4 (simulation) + Layer 6
+    #          (CVaR). Guarded so it never crashes and never fabricates weights.
+    label_tail = "3 — Tail-Risk Minimization"
+    print(f"\n{'='*62}")
+    print(f"  {label_tail}")
+    print(f"{'='*62}")
+    print("  Tail-Risk pending Layers 4 & 6 -- not yet implemented")
+    print("  (CVaR optimizer requires the Layer 4 simulation; no weights produced.)")
+    print(f"{'='*62}")
 
     if not portfolios:
         print("\n  All optimisations failed. No output file written.")
