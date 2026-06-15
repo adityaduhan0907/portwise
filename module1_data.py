@@ -45,11 +45,39 @@ MOM_WINDOW        = 11     # holding-period months = 12 − 1
 MIN_DATA_FRAC     = 0.70
 SCRIPT_DIR        = os.path.dirname(os.path.abspath(__file__))
 
-# ── Market constants ────────────────────────────────────────────────────────────
-ERP_USA   = 0.058093   # US Equity Risk Premium
-ERP_INDIA = 0.0750     # India Equity Risk Premium
-RF_INDIA  = 0.0675     # India risk-free rate (10Y G-Sec, hardcoded)
-CAPM_ERP  = ERP_USA    # backward-compat alias
+# ── Factor-model data source ────────────────────────────────────────────────────
+DATA_POINTS_PATH = os.path.join(SCRIPT_DIR, "data_points.xlsx")
+
+# ── Factor-history handoff (from module 0) + residual handoff (to Part B / Layer 4)
+FACTOR_HISTORY_PATH   = os.path.join(SCRIPT_DIR, "factor_history.json")    # module0 -> here
+FACTOR_RESIDUALS_PATH = os.path.join(SCRIPT_DIR, "factor_residuals.json")  # here -> Part B
+RESIDUAL_START        = "1960-01-01"   # fetch max monthly history from here onward
+
+# Category-beta key -> factor-file column NAME (align betas to factors BY NAME).
+# US betas use "MKT"; the matching factor column is named "Mkt-RF".
+US_BETA_TO_FACTOR = {"MKT": "Mkt-RF", "SMB": "SMB", "HML": "HML"}
+IN_BETA_TO_FACTOR = {"MF": "MF", "SMB": "SMB", "HML": "HML", "WML": "WML"}
+
+# Size split thresholds — native currency, NO FX conversion
+US_SIZE_SPLIT    = 6e9       # $6 billion (USD market cap)
+INDIA_SIZE_SPLIT = 1.5e12    # ₹1.5 trillion (INR market cap)
+
+# (size, pb_class) -> column letter in data_points.xlsx
+#   US 3-factor    (cols B-G): rows 2=MKT 3=SMB 4=HML, premiums row 6
+US_BUCKET_COL = {
+    ("small", "growth"):  "B",   ("small", "value"):   "C",
+    ("big",   "growth"):  "D",   ("big",   "value"):   "E",
+    ("small", "neutral"): "F",   ("big",   "neutral"): "G",
+}
+#   India 4-factor (cols J-O): rows 2=MF 3=SMB 4=HML 5=WML, premiums row 7
+INDIA_BUCKET_COL = {
+    ("big",   "neutral"): "J",   ("big",   "growth"):  "K",
+    ("small", "value"):   "L",   ("small", "neutral"): "M",
+    ("small", "growth"):  "N",   ("big",   "value"):   "O",
+}
+# Neutral-bucket fallback columns used when P/B is unavailable
+US_PB_FALLBACK    = {"big": "G", "small": "F"}
+INDIA_PB_FALLBACK = {"big": "J", "small": "M"}
 
 
 def _load_risk_free_rate(fallback=0.043):
@@ -210,51 +238,455 @@ def annualised_stats_split(mom_return, longrun_monthly_returns):
     }
 
 
-# ── CAPM expected returns ──────────────────────────────────────────────────────
+# ── Factor-model expected returns (Fama-French) ─────────────────────────────────
+
+def _to_float(x):
+    """Coerce to float; return None for None / NaN / garbage."""
+    try:
+        if x is None:
+            return None
+        f = float(x)
+        return None if math.isnan(f) else f
+    except (TypeError, ValueError):
+        return None
+
+
+def _load_factor_model(path=DATA_POINTS_PATH):
+    """
+    Read factor betas and premiums from data_points.xlsx in one open.
+    Betas are raw; RF + factor premiums are stored as percents (-> /100).
+    Returns {"us_betas", "us_prem", "in_betas", "in_prem"}.
+    """
+    import openpyxl
+    wb = openpyxl.load_workbook(path, data_only=True)
+    ws = wb.active
+    val = lambda coord: float(ws[coord].value)
+
+    # US 3-factor betas: cols B-G, rows 2=MKT 3=SMB 4=HML
+    us_betas = {
+        col: {"MKT": val(f"{col}2"), "SMB": val(f"{col}3"), "HML": val(f"{col}4")}
+        for col in "BCDEFG"
+    }
+    # US premiums (row 6): B6=RF C6=MKT D6=SMB E6=HML
+    us_prem = {
+        "RF":  val("B6") / 100.0, "MKT": val("C6") / 100.0,
+        "SMB": val("D6") / 100.0, "HML": val("E6") / 100.0,
+    }
+    # India 4-factor betas: cols J-O, rows 2=MF 3=SMB 4=HML 5=WML
+    in_betas = {
+        col: {"MF": val(f"{col}2"), "SMB": val(f"{col}3"),
+              "HML": val(f"{col}4"), "WML": val(f"{col}5")}
+        for col in "JKLMNO"
+    }
+    # India premiums (row 7): B7=RF C7=MF D7=SMB E7=HML F7=WML
+    in_prem = {
+        "RF":  val("B7") / 100.0, "MF":  val("C7") / 100.0,
+        "SMB": val("D7") / 100.0, "HML": val("E7") / 100.0,
+        "WML": val("F7") / 100.0,
+    }
+    wb.close()
+    return {"us_betas": us_betas, "us_prem": us_prem,
+            "in_betas": in_betas, "in_prem": in_prem}
+
+
+def _classify_size(is_india, market_cap):
+    """big / small by native-currency market cap (no FX conversion)."""
+    split = INDIA_SIZE_SPLIT if is_india else US_SIZE_SPLIT
+    if market_cap is None:
+        return "small"   # conservative default when market cap is unavailable
+    return "big" if market_cap >= split else "small"
+
+
+def _classify_pb(pb):
+    """value (<1.5) / neutral (1.5-4) / growth (>4); None if P/B unavailable."""
+    if pb is None or pb <= 0:
+        return None
+    if pb < 1.5:
+        return "value"
+    if pb > 4.0:
+        return "growth"
+    return "neutral"
+
+
+def _assign_bucket(is_india, size, pb_class):
+    """Return (column_letter, human_label). P/B missing -> neutral fallback."""
+    if pb_class is None:
+        col = (INDIA_PB_FALLBACK if is_india else US_PB_FALLBACK)[size]
+        return col, f"{size}+neutral (P/B missing -> col {col})"
+    table = INDIA_BUCKET_COL if is_india else US_BUCKET_COL
+    return table[(size, pb_class)], f"{size}+{pb_class}"
+
+
+def _factor_expected_return(is_india, market_cap, pb, model):
+    """
+    Bucket one stock and return its factor-model expected return plus the
+    components needed for display/export.
+    """
+    size       = _classify_size(is_india, market_cap)
+    pb_class   = _classify_pb(pb)
+    col, label = _assign_bucket(is_india, size, pb_class)
+
+    if is_india:
+        b, p = model["in_betas"][col], model["in_prem"]
+        er = (p["RF"] + b["MF"] * p["MF"] + b["SMB"] * p["SMB"]
+              + b["HML"] * p["HML"] + b["WML"] * p["WML"])
+        beta_mkt, mkt_prem = b["MF"], p["MF"]
+        # Betas keyed by the factor-file column NAMES (India sheet order).
+        betas_by_factor = {IN_BETA_TO_FACTOR[k]: b[k] for k in ("MF", "SMB", "HML", "WML")}
+    else:
+        b, p = model["us_betas"][col], model["us_prem"]
+        er = (p["RF"] + b["MKT"] * p["MKT"] + b["SMB"] * p["SMB"]
+              + b["HML"] * p["HML"])
+        beta_mkt, mkt_prem = b["MKT"], p["MKT"]
+        # "MKT" beta aligns to the factor named "Mkt-RF".
+        betas_by_factor = {US_BETA_TO_FACTOR[k]: b[k] for k in ("MKT", "SMB", "HML")}
+
+    return {
+        "market":          "India" if is_india else "USA",
+        "size":            size,
+        "pb_class":        pb_class if pb_class is not None else "missing",
+        "column":          col,
+        "bucket":          label,
+        "beta_mkt":        beta_mkt,
+        "betas_by_factor": betas_by_factor,
+        "rf":              p["RF"],
+        "mkt_prem":        mkt_prem,
+        "expected_return": er,
+    }
+
+
+def _fetch_cap_pb(ticker, max_retries=3, delay=1):
+    """
+    Fetch (marketCap, priceToBook) from yfinance ticker.info.
+    If priceToBook is missing, compute currentPrice / bookValue.
+    Returns (market_cap_or_None, pb_or_None).
+    """
+    info = {}
+    for attempt in range(max_retries):
+        try:
+            info = yf.Ticker(ticker).info or {}
+            if info:
+                break
+        except Exception:
+            info = {}
+        if attempt < max_retries - 1:
+            time.sleep(delay)
+
+    market_cap = _to_float(info.get("marketCap"))
+
+    pb = _to_float(info.get("priceToBook"))
+    if pb is None:
+        cp = _to_float(info.get("currentPrice"))
+        bv = _to_float(info.get("bookValue"))
+        if cp is not None and bv not in (None, 0):
+            pb = cp / bv
+    return market_cap, pb
+
 
 def calculate_capm_returns(tickers, rf_usa):
     """
-    Fetch beta for each ticker (3 retries, fallback beta=1.0) and compute
-    CAPM expected return using per-market constants:
+    Factor-model expected returns (replaces the old single-beta CAPM):
 
-      India (.NS): E[r] = RF_INDIA + beta × ERP_INDIA
-      USA  (else): E[r] = rf_usa   + beta × ERP_USA
+      US    (3-factor FF) : E[r] = RF + bMKT*MKT + bSMB*SMB + bHML*HML
+      India (4-factor FF) : E[r] = RF + bMF*MF + bSMB*SMB + bHML*HML + bWML*WML
 
-    Returns dict {ticker: {"beta", "market", "rf", "erp", "expected_return"}}
+    Each stock is bucketed by size (native-currency market cap) and P/B
+    (value / neutral / growth); the matching column's betas and the row-6
+    (US) / row-7 (India) premiums come from data_points.xlsx.
+    Market: ticker ending .NS / .BO -> India, otherwise US.
+
+    Output shape is unchanged so module2 and the Excel export keep working:
+      {ticker: {"beta", "market", "rf", "erp", "expected_return"}}
+    where "beta" is the market-factor loading and "erp" the market premium.
+    (rf_usa is retained for signature compatibility; RF now comes from the file.)
     """
+    model = _load_factor_model()
     results = {}
     for ticker in tickers:
-        is_india = ticker.upper().endswith(".NS")
-        rf  = RF_INDIA  if is_india else rf_usa
-        erp = ERP_INDIA if is_india else ERP_USA
-
-        beta = None
-        for attempt in range(3):
-            try:
-                info = yf.Ticker(ticker).info
-                raw  = info.get("beta")
-                if raw is not None:
-                    candidate = float(raw)
-                    if not math.isnan(candidate):
-                        beta = candidate
-                        break
-            except Exception:
-                pass
-            if attempt < 2:
-                time.sleep(1)
-
-        if beta is None:
-            print(f"  WARNING: Beta not available for {ticker}. Using market beta of 1.0")
-            beta = 1.0
-
+        is_india = ticker.upper().endswith((".NS", ".BO"))
+        market_cap, pb = _fetch_cap_pb(ticker)
+        comp = _factor_expected_return(is_india, market_cap, pb, model)
         results[ticker] = {
-            "beta":            beta,
-            "market":          "India" if is_india else "USA",
-            "rf":              rf,
-            "erp":             erp,
-            "expected_return": rf + beta * erp,
+            "beta":            comp["beta_mkt"],
+            "market":          comp["market"],
+            "rf":              comp["rf"],
+            "erp":             comp["mkt_prem"],
+            "expected_return": comp["expected_return"],
+            "column":          comp["column"],
+            "bucket":          comp["bucket"],
+            "betas_by_factor": comp["betas_by_factor"],
         }
     return results
+
+
+# ── Factor covariance + per-asset residuals (Part A) ────────────────────────────
+
+def _load_factor_history(path=FACTOR_HISTORY_PATH):
+    """
+    Load module 0's cleaned factor history (factor_history.json) and rebuild,
+    per market, a monthly factor DataFrame and monthly RF Series indexed by
+    month Period. Factor returns and RF are already decimals.
+
+    Returns {market: {"factors": DataFrame, "rf": Series, "names": [...]}}.
+    Returns {} if the file is missing/unreadable (caller handles gracefully).
+    """
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        print(f"  WARNING: {os.path.basename(path)} not found -- run module0 first. "
+              "Skipping factor covariance / residuals.")
+        return {}
+    except Exception as exc:
+        print(f"  WARNING: Could not read {os.path.basename(path)} ({exc}).")
+        return {}
+
+    out = {}
+    for market, md in data.get("markets", {}).items():
+        idx = pd.PeriodIndex(pd.to_datetime(md["dates"]), freq="M")
+        names = [c for c in md["columns"] if c != "RF"]            # factor names, by name
+        factors = pd.DataFrame({c: md["factor_returns"][c] for c in names}, index=idx)
+        rf = pd.Series(md.get("monthly_rf", []), index=idx, name="RF")
+        out[market] = {"factors": factors, "rf": rf, "names": names}
+    return out
+
+
+def compute_factor_covariance(factor_hist):
+    """
+    Factor covariance matrix F per market over the FULL available history
+    (monthly): US -> 3x3 of [Mkt-RF, SMB, HML]; India -> 4x4 of [MF, SMB, HML, WML].
+    Returns {market: DataFrame F (labeled rows/cols)}.
+    """
+    F = {}
+    for market, fh in factor_hist.items():
+        fac = fh["factors"].dropna()
+        if fac.empty:
+            continue
+        F[market] = fac.cov()          # monthly factor covariance, labeled
+    return F
+
+
+def compute_asset_residuals(symbol, monthly_returns, market, betas_by_factor, factor_hist):
+    """
+    Category-beta residuals over the asset's MAX available history.
+
+    For every month the asset has a return that also exists in the factor file:
+        residual = (asset_return - RF_that_month) - (betas . factors_that_month)
+    RF is the per-month factor-file RF (US sheet col E / India col F), matched by
+    month -- never a constant. Betas are the fixed category betas (NOT OLS),
+    aligned to factor columns BY NAME.
+
+    Returns (residual_series_indexed_by_Period, n_asset_months).
+    """
+    n_asset_months = int(monthly_returns.shape[0])
+    fh = factor_hist.get(market)
+    if fh is None or monthly_returns.empty:
+        return pd.Series(dtype=float), n_asset_months
+
+    factors, rf = fh["factors"], fh["rf"]
+    common = monthly_returns.index.intersection(factors.index).intersection(rf.index)
+    if len(common) == 0:
+        return pd.Series(dtype=float), n_asset_months
+
+    excess = monthly_returns.reindex(common) - rf.reindex(common)
+    contrib = pd.Series(0.0, index=common)
+    for fname, beta in betas_by_factor.items():
+        if fname in factors.columns:
+            contrib = contrib + beta * factors[fname].reindex(common)
+
+    residual = (excess - contrib).dropna()
+    return residual, n_asset_months
+
+
+def _monthly_returns_max_history(symbol, end):
+    """
+    Fetch the asset's monthly returns over max history (from RESIDUAL_START),
+    indexed by month Period. Returns an empty Series on failure.
+    """
+    _, prices, err = resolve_and_fetch(symbol, RESIDUAL_START, end, "1mo")
+    if err or prices is None or prices.empty:
+        return pd.Series(dtype=float)
+    rets = prices.sort_index().pct_change().dropna()
+    if rets.empty:
+        return pd.Series(dtype=float)
+    rets.index = pd.PeriodIndex(rets.index, freq="M")
+    rets = rets[~rets.index.duplicated(keep="last")]
+    return rets
+
+
+def _load_use_factor_flag(path=FACTOR_HISTORY_PATH, default=False):
+    """
+    Read module 0's use_factor_covariance flag from factor_history.json.
+    True  -> some portfolio asset has < 36 months -> use factor covariance (B).
+    False -> all assets have long history          -> use Ledoit-Wolf (A).
+    """
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        return bool(data.get("use_factor_covariance", default))
+    except FileNotFoundError:
+        print(f"  WARNING: {os.path.basename(path)} not found -- defaulting "
+              f"use_factor_covariance={default} (Ledoit-Wolf).")
+        return default
+    except Exception as exc:
+        print(f"  WARNING: Could not read covariance flag ({exc}); "
+              f"defaulting to {default}.")
+        return default
+
+
+def _manual_ledoit_wolf(X):
+    """
+    Ledoit-Wolf (2004) shrinkage toward the scaled identity mu*I -- the same
+    target sklearn.covariance.LedoitWolf uses. Pure-numpy fallback for when
+    scikit-learn is unavailable. X is (n_samples, n_features), returns
+    (covariance ndarray, shrinkage_constant in [0, 1]).
+    """
+    X = np.asarray(X, dtype=float)
+    n, p = X.shape
+    Xc = X - X.mean(axis=0)
+    S  = (Xc.T @ Xc) / n                      # MLE sample cov (ddof=0)
+    mu = np.trace(S) / p
+    prior = mu * np.eye(p)
+
+    Y = Xc ** 2
+    phi_mat = (Y.T @ Y) / n - S ** 2          # asymptotic variances of S entries
+    phi     = phi_mat.sum()
+    rho     = np.trace(phi_mat)               # spherical (mu*I) target
+    gamma   = np.sum((S - prior) ** 2)        # squared Frobenius misfit to target
+
+    kappa     = (phi - rho) / gamma if gamma > 0 else 0.0
+    shrinkage = float(np.clip(kappa / n, 0.0, 1.0))
+    sigma     = shrinkage * prior + (1.0 - shrinkage) * S
+    return sigma, shrinkage
+
+
+def _ledoit_wolf_cov(returns_df):
+    """
+    MONTHLY Ledoit-Wolf shrinkage covariance (Method A). Prefers
+    sklearn.covariance.LedoitWolf; falls back to the numpy equivalent.
+    Returns (labeled DataFrame, source string).
+    """
+    cols = list(returns_df.columns)
+    X = returns_df[cols].values
+    try:
+        from sklearn.covariance import LedoitWolf
+        lw   = LedoitWolf().fit(X)
+        cov  = lw.covariance_
+        src  = f"sklearn LedoitWolf (shrinkage={float(lw.shrinkage_):.4f})"
+    except Exception:
+        cov, shrink = _manual_ledoit_wolf(X)
+        src = f"numpy LedoitWolf equiv (shrinkage={shrink:.4f})"
+    return pd.DataFrame(cov, index=cols, columns=cols), src
+
+
+def _factor_model_cov(common, asset_residuals, F_by_market):
+    """
+    MONTHLY factor-decomposition covariance (Method B): Sigma = B F Bᵀ + D.
+      B = category betas (assets x factors), aligned to F BY FACTOR NAME
+      F = the market's factor covariance (Part A), D = diag(residual variances)
+    Only valid for a SINGLE-market universe. A mixed US+India universe is the
+    deferred case -> returns (None, reason) so the caller can guard.
+    Returns (labeled DataFrame or None, label/reason).
+    """
+    markets = {asset_residuals[s]["market"] for s in common if s in asset_residuals}
+    if len(markets) != 1:
+        return None, f"mixed markets {sorted(markets)} -- deferred"
+    market = next(iter(markets))
+
+    F_df = F_by_market.get(market)
+    if F_df is None or F_df.empty:
+        return None, f"no factor covariance available for {market}"
+
+    fnames = list(F_df.columns)               # factor order defines B's columns
+    Fm = F_df.values
+    B  = np.array([[float(asset_residuals[s]["betas"].get(fn, 0.0)) for fn in fnames]
+                   for s in common])
+    dvar = []
+    for s in common:
+        resid = asset_residuals[s]["residuals"]
+        dvar.append(float(resid.var(ddof=1)) if resid.shape[0] > 1 else 0.0)
+
+    sigma = B @ Fm @ B.T + np.diag(dvar)      # monthly asset covariance
+    df = pd.DataFrame(sigma, index=common, columns=common)
+    return df, f"{market}: {len(fnames)} factors x {len(common)} assets"
+
+
+def build_asset_covariance(common, cov_clean, returns_df, cov_cols,
+                           use_factor_cov, asset_residuals, F_by_market):
+    """
+    Build the asset covariance and ANNUALISE it (x TRADING_MONTHS) so the output
+    contract is identical to the previous 10-year sample covariance that module 2
+    reads from the 'Annualised Cov' sheet (same shape, labels, annualised units).
+
+    Method A (use_factor_cov False, DEFAULT): Ledoit-Wolf on 10y monthly returns.
+    Method B (use_factor_cov True): factor decomposition B F Bᵀ + D (single market).
+                                    Mixed US+India is DEFERRED -> guarded stopgap.
+    Returns (annualised covariance DataFrame over `common`, method label).
+    """
+    # Degenerate: no monthly overlap -> keep the original daily-sample fallback.
+    if cov_clean.empty or len(cov_clean) < 2:
+        cov = returns_df[cov_cols].dropna().cov() * TRADING_DAYS
+        return cov.loc[common, common], "fallback: daily sample cov (no monthly overlap)"
+
+    if use_factor_cov:
+        monthly_df, info = _factor_model_cov(common, asset_residuals, F_by_market)
+        if monthly_df is not None:
+            return (monthly_df.loc[common, common] * TRADING_MONTHS,
+                    f"Method B -- factor B F B^T + D  [{info}]")
+        # Mixed-market factor covariance (cross-market F) is intentionally deferred.
+        print("\n  NOTE: use_factor_covariance=True but the portfolio mixes markets.")
+        print(f"        {info}. Cross-market factor covariance is DEFERRED (not solved).")
+        print("        Guard: falling back to Ledoit-Wolf (Method A) as a labeled stopgap.")
+        monthly_df, src = _ledoit_wolf_cov(cov_clean[common])
+        return (monthly_df.loc[common, common] * TRADING_MONTHS,
+                f"Method B DEFERRED (mixed) -> Method A stopgap  [{src}]")
+
+    monthly_df, src = _ledoit_wolf_cov(cov_clean[common])
+    return (monthly_df.loc[common, common] * TRADING_MONTHS,
+            f"Method A -- Ledoit-Wolf  [{src}]")
+
+
+def write_residuals_handoff(F_by_market, asset_residuals, generated_at,
+                            path=FACTOR_RESIDUALS_PATH):
+    """
+    Persist (same write-a-JSON handoff pattern as module 0):
+      - factor covariance F per market (labeled)
+      - per asset: category betas, residual VARIANCE (diagonal D for Part B),
+        and the FULL residual SHOCK vector + its months (for Layer 4 simulation;
+        the simulation re-adds the month's RF during reconstruction).
+    """
+    cov_payload = {}
+    for market, F in F_by_market.items():
+        cov_payload[market] = {
+            "factors":  list(F.columns),
+            "matrix":   [[round(float(x), 12) for x in row] for row in F.values],
+            "n_months": int(F.attrs.get("n_months", 0)) or None,
+        }
+
+    assets_payload = {}
+    for sym, info in asset_residuals.items():
+        resid = info["residuals"]
+        assets_payload[sym] = {
+            "market":            info["market"],
+            "bucket":            info["bucket"],
+            "column":            info["column"],
+            "betas":             {k: round(float(v), 8) for k, v in info["betas"].items()},
+            "months_history":    info["months_history"],
+            "residual_count":    int(resid.shape[0]),
+            "residual_variance": (round(float(resid.var(ddof=1)), 12)
+                                  if resid.shape[0] > 1 else None),
+            "residual_months":   [str(p) for p in resid.index],
+            "residual_shocks":   [round(float(x), 10) for x in resid.values],
+        }
+
+    payload = {
+        "generated_at":     generated_at,
+        "factor_covariance": cov_payload,
+        "assets":           assets_payload,
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+    return path
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
@@ -389,19 +821,14 @@ def main():
                 r = 0.0
         mu_dict[symbol] = r
 
-    # ── 4. Compute annualised covariance (long-run monthly) ────────────────────
-    cov_cols    = [s for s in symbols if s in cov_rets_df.columns]
-    cov_clean   = cov_rets_df[cov_cols].dropna()
-
-    if not cov_clean.empty:
-        cov_matrix = cov_clean.cov() * TRADING_MONTHS
-    else:
-        cov_matrix = returns_df[cov_cols].dropna().cov() * TRADING_DAYS
-        print("  WARNING: Using daily returns for covariance -- long-run monthly unavailable.")
+    # ── 4. Asset return series for covariance (10y monthly) ────────────────────
+    #        (the covariance MATRIX itself is built later, after the factor
+    #         structures, so Method B can use them -- see "Covariance" below.)
+    cov_cols  = [s for s in symbols if s in cov_rets_df.columns]
+    cov_clean = cov_rets_df[cov_cols].dropna()
+    common    = list(cov_cols)
 
     # ── 5. Per-stock stats and correlation ────────────────────────────────────
-    common = [s for s in symbols if s in cov_matrix.columns]
-
     stats_rows = {}
     for s in common:
         lr_rets = cov_clean[s] if s in cov_clean.columns else pd.Series(dtype=float)
@@ -412,9 +839,9 @@ def main():
 
     corr_df = cov_clean.corr() if not cov_clean.empty else returns_df[cov_cols].corr()
 
-    # ── 6. CAPM expected returns ───────────────────────────────────────────────
+    # ── 6. Factor-model expected returns ───────────────────────────────────────
     print(f"\n{'='*W}")
-    print(f"  CAPM EXPECTED RETURNS  (USA ERP={ERP_USA*100:.4f}%, India ERP={ERP_INDIA*100:.4f}%)")
+    print( "  FACTOR-MODEL EXPECTED RETURNS  (US: 3-factor FF | India: 4-factor FF+WML)")
     print(f"{'='*W}")
     capm_results = calculate_capm_returns(common, RISK_FREE_RATE)
     for s, v in capm_results.items():
@@ -433,6 +860,82 @@ def main():
         }
         for t, v in capm_results.items()
     ])
+
+    # ── 6b. Factor covariance F + category-beta residuals (Part A) ─────────────
+    #        Computed here so the covariance build below (6c) can consume them.
+    print(f"\n{'='*W}")
+    print( "  FACTOR COVARIANCE (F) + CATEGORY-BETA RESIDUALS  (Part A)")
+    print(f"{'='*W}")
+
+    factor_hist = _load_factor_history()
+    F_by_market = compute_factor_covariance(factor_hist)
+    for market, F in F_by_market.items():
+        n_months = len(factor_hist[market]["factors"].dropna())
+        F.attrs["n_months"] = n_months
+        print(f"\n  Factor covariance F -- {market}  (monthly, {n_months} months, "
+              f"{F.shape[0]}x{F.shape[1]})")
+        print(F.round(8).to_string())
+
+    asset_residuals = {}
+    print(f"\n  Per-asset residuals (max history, betas by factor name):")
+    for s in common:
+        cr = capm_results.get(s)
+        if cr is None:
+            continue
+        market    = cr["market"]
+        betas     = cr["betas_by_factor"]
+        m_rets    = _monthly_returns_max_history(s, today)
+        residuals, n_hist = compute_asset_residuals(s, m_rets, market, betas, factor_hist)
+        asset_residuals[s] = {
+            "market":         market,
+            "bucket":         cr["bucket"],
+            "column":         cr["column"],
+            "betas":          betas,
+            "months_history": n_hist,
+            "residuals":      residuals,
+        }
+        beta_str = ", ".join(f"{k}={v:+.3f}" for k, v in betas.items())
+        rvar = residuals.var(ddof=1) if residuals.shape[0] > 1 else float("nan")
+        print(f"    {s:<22} [{market:5}]  {cr['bucket']:<22} col {cr['column']}")
+        print(f"        betas : {beta_str}")
+        print(f"        history={n_hist:>4}mo  residuals={residuals.shape[0]:>4}  "
+              f"resid_var={rvar:.6e}")
+
+    try:
+        rp = write_residuals_handoff(F_by_market, asset_residuals, today.isoformat())
+        print(f"\n  Saved residual handoff -> {rp}")
+    except Exception as exc:
+        print(f"\n  ERROR: Could not write residual handoff: {exc}")
+
+    # ── 6c. Covariance (Method A Ledoit-Wolf default / Method B factor fallback) ─
+    #        Switches on module 0's use_factor_covariance flag. Output is the
+    #        annualised, ticker-labeled matrix module 2 reads from 'Annualised Cov'
+    #        -- same shape/labels/units as before (the optimizer is unaffected).
+    use_factor_cov = _load_use_factor_flag()
+    cov_matrix, cov_method = build_asset_covariance(
+        common, cov_clean, returns_df, cov_cols,
+        use_factor_cov, asset_residuals, F_by_market,
+    )
+
+    print(f"\n{'='*W}")
+    print("  COVARIANCE MATRIX  (Layer 2 / Part B)")
+    print(f"{'='*W}")
+    print(f"  use_factor_covariance (module0 flag) : {use_factor_cov}")
+    print(f"  Method                               : {cov_method}")
+    print(f"  Shape / labels                       : {cov_matrix.shape}  "
+          f"[{', '.join(map(str, cov_matrix.columns))}]")
+    print(f"  Units                                : annualised (monthly x {TRADING_MONTHS})")
+    diag = {s: round(float(cov_matrix.loc[s, s]), 6) for s in common}
+    print(f"  Diagonal (annualised variances)      : {diag}")
+    if len(common) >= 2:
+        a, b = common[0], common[1]
+        print(f"  Sample off-diagonals                 : "
+              f"cov[{a},{b}]={cov_matrix.loc[a, b]:+.6f}", end="")
+        if len(common) >= 3:
+            c = common[2]
+            print(f" | cov[{a},{c}]={cov_matrix.loc[a, c]:+.6f} "
+                  f"| cov[{b},{c}]={cov_matrix.loc[b, c]:+.6f}", end="")
+        print()
 
     # ── 7. Prepare Annualised Mu and Cov for export ───────────────────────────
     mu_series  = pd.Series({s: mu_dict[s] for s in common}, name="Annualised_Expected_Return")
@@ -477,6 +980,7 @@ def main():
         f"Expected Return : Momentum window (12M-1M, monthly data; most recent "
         f"{SKIP_RECENT} month skipped for reversal)",
         f"Risk (Volatility): {LONGRUN_YEARS}-year monthly data, annualised (x sqrt(12))",
+        f"Covariance method: {cov_method}  (annualised x{TRADING_MONTHS}; switches on module0 use_factor_covariance)",
         f"Risk-free rate   : {RISK_FREE_RATE*100:.4f}% (from risk_free_rates.json)",
         "Module2 / Module3: read 'Annualised Mu' and 'Annualised Cov' sheets directly.",
     ]

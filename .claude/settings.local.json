@@ -2,7 +2,11 @@
   "permissions": {
     "allow": [
       "Bash(python -c ' *)",
-      "Bash(python *)"
+      "Bash(python *)",
+      "Bash(git --no-pager diff -- module1_data.py)",
+      "Bash(python module1_data.py)",
+      "Bash(echo \"exit=$?\")",
+      "Read(//tmp/**)"
     ]
   }
 }

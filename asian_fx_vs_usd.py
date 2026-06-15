@@ -28,7 +28,7 @@ CURRENCIES = {
 
 END_DATE   = date.today()
 START_DATE = END_DATE.replace(year=END_DATE.year - 1)
-OUTPUT     = "asian_fx_vs_usd.xlsx"
+OUTPUT     = r"C:\Users\adity\Documents\FinanceScripts\asian_fx_vs_usd.xlsx"
 
 # ── Data retrieval ─────────────────────────────────────────────────────────────
 
