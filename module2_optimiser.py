@@ -34,6 +34,8 @@ import numpy as np
 import pandas as pd
 from scipy.optimize import minimize
 
+import tail_risk_optimizer as tro   # Layer 6 — fills Goal 3 (CVaR)
+
 warnings.filterwarnings("ignore")
 
 # ── Configuration ──────────────────────────────────────────────────────────────
@@ -73,6 +75,18 @@ def _load_risk_free_rate(fallback=0.043):
 
 
 RISK_FREE_RATE = _load_risk_free_rate()
+
+
+def load_capm_mu(returns_path, tickers, fallback_mu):
+    """
+    Load the FACTOR-model expected returns (FF3-US / Carhart4-India) from the
+    "CAPM Returns" sheet, aligned to `tickers`. Any ticker missing from the sheet
+    falls back to fallback_mu[i]. Shared by main() and the Layer 7 resampler.
+    """
+    capm_df  = pd.read_excel(returns_path, sheet_name="CAPM Returns")
+    capm_map = dict(zip(capm_df["Ticker"], capm_df["CAPM_Expected_Return"]))
+    return np.array([capm_map.get(t, fallback_mu[i]) for i, t in enumerate(tickers)])
+
 
 # ── Helper: portfolio statistics ───────────────────────────────────────────────
 
@@ -288,9 +302,7 @@ def main():
     #        (FF3-US / Carhart4-India model, written by module 1 as "CAPM Returns".)
     capm_mu = mu.copy()   # default: fall back to momentum if factor mu unavailable
     try:
-        capm_df  = pd.read_excel(returns_path, sheet_name="CAPM Returns")
-        capm_map = dict(zip(capm_df["Ticker"], capm_df["CAPM_Expected_Return"]))
-        capm_mu  = np.array([capm_map.get(t, mu[i]) for i, t in enumerate(tickers)])
+        capm_mu = load_capm_mu(returns_path, tickers, mu)
         print(f"  Factor returns loaded for the Max Risk-Adjusted goal.")
         for t, r in zip(tickers, capm_mu):
             print(f"    {t:<22} {r*100:>7.2f}%  (factor)")
@@ -334,15 +346,24 @@ def main():
     else:
         print(f"\n  WARNING: {msg_rar}")
 
-    # Goal 3 — Tail-Risk Minimization: STUB. Needs Layer 4 (simulation) + Layer 6
-    #          (CVaR). Guarded so it never crashes and never fabricates weights.
-    label_tail = "3 — Tail-Risk Minimization"
-    print(f"\n{'='*62}")
-    print(f"  {label_tail}")
-    print(f"{'='*62}")
-    print("  Tail-Risk pending Layers 4 & 6 -- not yet implemented")
-    print("  (CVaR optimizer requires the Layer 4 simulation; no weights produced.)")
-    print(f"{'='*62}")
+    # Goal 3 — Tail-Risk Minimization (Layer 6 CVaR optimizer over Layer 4 scenarios).
+    #          Reads simulated_returns.npz; minimises CVaR(95%) with a (default
+    #          non-binding) annualised return floor. Never fabricates weights:
+    #          a missing scenario file or an infeasible floor surfaces a message.
+    sim_path = os.path.join(SCRIPT_DIR, "simulated_returns.npz")
+    if not os.path.exists(sim_path):
+        print(f"\n{'='*62}")
+        print("  3 — Tail-Risk Minimization (CVaR 95%)  [Layer 6]")
+        print(f"{'='*62}")
+        print("  Layer 4 scenarios not found (simulated_returns.npz).")
+        print("  Run simulation_engine.py first; skipping (no weights produced).")
+        print(f"{'='*62}")
+    else:
+        scen, scen_tickers = tro.load_scenarios(sim_path)
+        tail_result = tro.solve_min_cvar(scen, scen_tickers, r_min=0.0)
+        tro.print_tail_risk_result(tail_result)
+        if tail_result["status"] == "optimal":
+            portfolios.append(("Tail-Risk CVaR", tro.build_export_df(tail_result)))
 
     if not portfolios:
         print("\n  All optimisations failed. No output file written.")

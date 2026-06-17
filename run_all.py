@@ -9,11 +9,23 @@ executes each module in sequence without further interruption.
 Pipeline
 --------
   module0_riskfree    -> fetch live risk-free rates
-  module1_data        -> download prices, momentum returns, covariance
-  module2_optimiser   -> mean-variance optimisation (3 portfolios)
+  module1_data        -> parameter estimation (returns, covariance, factor residuals)
+  simulation_engine   -> Monte Carlo scenarios (Layer 4) -> simulated_returns.npz
+  module2_optimiser   -> Layer 3 goals incl. Goal 3 CVaR (single-shot record)
+  resampling_wrapper  -> Layer 7 Michaud resampling (B=500) -> resampled_portfolios.xlsx [CANONICAL]
+  risk_evaluation     -> Layer 5 risk metrics (3 resampled goals + current holdings)
+                         -> risk_evaluation_summary.json
   module3_frontier    -> efficient frontier chart
-  module4_rebalance   -> portfolio rebalancing plan  (non-interactive)
-  module5_report      -> HTML report (skipped if file not found)
+  module4_rebalance   -> rebalancing plan (targets = resampled weights; single-shot fallback)
+  module5_report      -> HTML report (skipped gracefully if file not found)
+
+NOTES
+  - simulation_engine (Layer 4) must run after module1 and before every CVaR
+    consumer (module2 Goal 3, Layer 7's CVaR path, Layer 5). The simulation_is_fresh()
+    guard enforces this before module2.
+  - resampled_portfolios.xlsx is CANONICAL for rebalancing; optimised_portfolios.xlsx
+    is retained as the single-shot record. Layer 7's base_seed is read from
+    simulated_returns.npz so the whole stochastic pipeline is reproducible from one seed.
 
 Robustness checks (automatic, with user prompts where applicable)
   - Data freshness   : warn if prices.xlsx > 1 day old
@@ -305,6 +317,183 @@ def run_subprocess(label, script_name, description=""):
         return False
 
 
+def simulation_is_fresh():
+    """
+    Cheap guard before the first CVaR consumer: the Layer 4 scenarios must exist
+    and be at least as new as Module 1's returns_stats.xlsx (i.e. built from the
+    current Module 1 outputs, not a stale prior run).
+    Returns (ok: bool, reason: str).
+    """
+    sim_path = os.path.join(SCRIPT_DIR, "simulated_returns.npz")
+    m1_path  = os.path.join(SCRIPT_DIR, "returns_stats.xlsx")
+    if not os.path.exists(sim_path):
+        return False, "simulated_returns.npz not found"
+    if os.path.exists(m1_path) and os.path.getmtime(sim_path) < os.path.getmtime(m1_path):
+        return False, "simulated_returns.npz is older than returns_stats.xlsx (stale)"
+    return True, "ok"
+
+
+def simulation_seed(default=None):
+    """
+    Read the random_seed recorded in simulated_returns.npz. Layer 7 reuses it as its
+    base_seed so the entire stochastic pipeline (simulation + resampling) is
+    reproducible from one seed. Returns int, or `default` if unavailable/unset.
+    """
+    import numpy as np
+    sim_path = os.path.join(SCRIPT_DIR, "simulated_returns.npz")
+    try:
+        data = np.load(sim_path, allow_pickle=True)
+        s = int(data["random_seed"])
+        return s if s >= 0 else default
+    except Exception:
+        return default
+
+
+# ── Layer 7 -- resampling (reuses resampling_wrapper; logic unchanged) ──────────
+
+def run_layer7(base_seed):
+    """
+    Michaud-resample all three goals (B=500) into resampled_portfolios.xlsx, the
+    CANONICAL weights file. Drives resampling_wrapper's public functions in-process
+    so the module's logic is untouched.
+    """
+    module_header("Layer 7", "Resampling (Michaud, B=500) -> resampled_portfolios.xlsx")
+    try:
+        import resampling_wrapper as rw
+    except Exception as exc:
+        _fail("Layer 7", f"cannot import resampling_wrapper: {exc}")
+        return False
+
+    if base_seed is None:
+        base_seed = rw.DEFAULT_SEED
+        print(f"  simulated_returns.npz had no usable seed -- using resampling "
+              f"default base_seed={base_seed}")
+    else:
+        print(f"  Base seed (from simulated_returns.npz): {base_seed}")
+
+    try:
+        tickers, capm_mu = rw._load_universe()
+        results = [rw.resample_goal(g, B=rw.DEFAULT_B, base_seed=base_seed)
+                   for g in rw.GOALS]
+        rw.write_resampled_xlsx(results, capm_mu, tickers)
+        rw.save_per_iter(results, tickers)
+        _ok("Layer 7")
+        return True
+    except Exception as exc:
+        _fail("Layer 7", f"resampling failed: {exc}")
+        return False
+
+
+# ── Layer 5 -- risk evaluation (reuses risk_evaluation; logic unchanged) ───────
+
+def _current_weights(inputs, tickers):
+    """
+    Convert the user's holdings (share counts) into portfolio weights over the
+    scenario tickers, value-weighted using prices.xlsx. Indian holdings are
+    converted INR->USD (via module4's FX helper) so a mixed book weights correctly;
+    for a single-currency book the conversion cancels in the normalisation.
+    Returns an ndarray aligned to `tickers`, or None if it cannot be derived.
+    """
+    import numpy as np
+    holdings = inputs.get("holdings", [])
+    if not holdings:
+        return None
+    try:
+        import module4_rebalance as m4
+        prices = m4.load_latest_prices(os.path.join(SCRIPT_DIR, "prices.xlsx"))
+    except Exception:
+        return None
+
+    values  = {t: 0.0 for t in tickers}
+    usd_inr = None
+    found   = False
+    for h in holdings:
+        try:
+            resolved, price = m4.lookup_price(h["ticker"], prices)
+        except Exception:
+            resolved, price = None, None
+        if resolved is None or resolved not in values or price is None:
+            continue
+        val = float(h["shares"]) * float(price)
+        if m4.is_indian(resolved):
+            if usd_inr is None:
+                usd_inr = m4.fetch_usd_inr_rate()
+            if usd_inr:
+                val /= usd_inr
+        values[resolved] += val
+        found = True
+
+    if not found:
+        return None
+    w = np.array([values[t] for t in tickers], dtype=float)
+    if w.sum() <= 0:
+        return None
+    return w / w.sum()
+
+
+def run_layer5(inputs, base_seed):
+    """
+    Evaluate risk metrics over the Layer 4 scenarios for each of the three CANONICAL
+    resampled goal portfolios PLUS the user's current portfolio, and write
+    risk_evaluation_summary.json keyed by portfolio. Drives risk_evaluation's public
+    functions in-process; its metric logic is untouched.
+    """
+    module_header("Layer 5", "Risk evaluation over scenarios -> risk_evaluation_summary.json")
+    try:
+        import risk_evaluation as rev
+    except Exception as exc:
+        _fail("Layer 5", f"cannot import risk_evaluation: {exc}")
+        return False
+
+    try:
+        returns, tickers = rev.load_scenarios(rev.SIM_PATH)
+    except Exception as exc:
+        _fail("Layer 5", f"could not load Layer 4 scenarios: {exc}")
+        return False
+
+    resampled_path = os.path.join(SCRIPT_DIR, "resampled_portfolios.xlsx")
+    if not os.path.exists(resampled_path):
+        _fail("Layer 5", "resampled_portfolios.xlsx not found -- Layer 7 must run first")
+        return False
+
+    seed = base_seed if base_seed is not None else 0
+    portfolios = {}
+    for sheet in ("Minimum Variance", "Max Risk-Adjusted", "Tail-Risk CVaR"):
+        try:
+            w = rev.load_weights_from_xlsx(sheet, tickers, path=resampled_path)
+            portfolios[sheet] = rev.evaluate_risk(
+                returns, w, tickers, random_seed=seed, label=sheet
+            )
+        except Exception as exc:
+            _warn(f"Layer 5: could not evaluate '{sheet}' ({exc})")
+
+    w_cur = _current_weights(inputs, tickers)
+    if w_cur is not None:
+        portfolios["Current Portfolio"] = rev.evaluate_risk(
+            returns, w_cur, tickers, random_seed=seed, label="Current Portfolio"
+        )
+    else:
+        _warn("Layer 5: could not derive current-portfolio weights from holdings; "
+              "summary will omit the 'Current Portfolio' entry.")
+
+    summary = {
+        "scenarios_seed":  base_seed,
+        "n_scenarios":     int(returns.shape[0]),
+        "tickers":         list(tickers),
+        "weights_source":  "resampled_portfolios.xlsx (canonical)",
+        "portfolios":      portfolios,        # keyed by portfolio name
+    }
+    try:
+        with open(rev.SUMMARY_PATH, "w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2)
+        print(f"  Evaluated: {', '.join(portfolios.keys())}")
+        _ok("Layer 5")
+        return True
+    except Exception as exc:
+        _fail("Layer 5", f"could not write risk_evaluation_summary.json: {exc}")
+        return False
+
+
 # ── Robustness checks ──────────────────────────────────────────────────────────
 
 def check_momentum(inputs):
@@ -452,8 +641,21 @@ def run_module4(inputs, today_str):
         _fail("Module 4", f"cannot import module4_rebalance: {exc}")
         return None
 
-    prices_path     = os.path.join(SCRIPT_DIR, "prices.xlsx")
-    portfolios_path = os.path.join(SCRIPT_DIR, "optimised_portfolios.xlsx")
+    prices_path = os.path.join(SCRIPT_DIR, "prices.xlsx")
+
+    # Rebalancing targets come from the CANONICAL resampled weights; the single-shot
+    # optimised file is the defensive fallback (kept as a record, never deleted).
+    resampled_path = os.path.join(SCRIPT_DIR, "resampled_portfolios.xlsx")
+    single_path    = os.path.join(SCRIPT_DIR, "optimised_portfolios.xlsx")
+    if os.path.exists(resampled_path):
+        portfolios_path = resampled_path
+        weights_source  = "resampled_portfolios.xlsx (canonical, Layer 7)"
+    else:
+        portfolios_path = single_path
+        weights_source  = "optimised_portfolios.xlsx (single-shot FALLBACK)"
+        _warn("resampled_portfolios.xlsx not found -- falling back to single-shot "
+              "optimised_portfolios.xlsx for rebalancing targets.")
+    print(f"  Rebalancing target weights source: {weights_source}")
 
     # Load latest prices from prices.xlsx
     try:
@@ -485,9 +687,22 @@ def run_module4(inputs, today_str):
         _warn("No valid holdings could be resolved. Skipping Module 4.")
         return None
 
-    # Ensure a portfolio choice is available
-    portfolio_opts = m4.load_portfolio_options(portfolios_path)
-    choice         = inputs.get("portfolio_choice")
+    # Ensure a portfolio choice is available (defensive: if the canonical resampled
+    # file is unreadable, fall back to the single-shot record rather than crashing).
+    try:
+        portfolio_opts = m4.load_portfolio_options(portfolios_path)
+        if not portfolio_opts:
+            raise ValueError("no portfolios parsed")
+    except Exception as exc:
+        if portfolios_path != single_path and os.path.exists(single_path):
+            _warn(f"Could not read {os.path.basename(portfolios_path)} ({exc}); "
+                  "falling back to optimised_portfolios.xlsx (single-shot).")
+            portfolios_path = single_path
+            portfolio_opts  = m4.load_portfolio_options(single_path)
+        else:
+            _fail("Module 4", f"could not read portfolio weights: {exc}")
+            return None
+    choice = inputs.get("portfolio_choice")
 
     if not choice or choice not in portfolio_opts:
         if choice:
@@ -600,7 +815,10 @@ def print_end_summary(inputs, rebalance_stats, today_str):
     expected_files = [
         "prices.xlsx",
         "returns_stats.xlsx",
+        "simulated_returns.npz",
         "optimised_portfolios.xlsx",
+        "resampled_portfolios.xlsx",
+        "risk_evaluation_summary.json",
         "efficient_frontier.png",
         f"rebalancing_plan_{date_stamp}.xlsx",
         f"portfolio_report_{date_stamp}.html",
@@ -622,8 +840,8 @@ def main():
     print(f"{'PORTFOLIO MODEL  --  MASTER PIPELINE RUNNER':^{W}}")
     print(f"  {today_str}")
     print(_bar("="))
-    print("  Pipeline: module0 -> module1 -> module2 -> module3 ->"
-          "  module4 -> module5")
+    print("  Pipeline: module0 -> module1 -> simulation -> module2 -> resample(L7)"
+          " -> riskeval(L5) -> module3 -> module4 -> module5")
 
     # ── Data freshness check (before collecting inputs) ────────────────────────
     prices_path = os.path.join(SCRIPT_DIR, "prices.xlsx")
@@ -716,12 +934,48 @@ def main():
             "Proceeding with remaining tickers."
         )
 
-    # ── MODULE 2 -- Optimisation ───────────────────────────────────────────────
+    # ── LAYER 4 -- Monte Carlo simulation ─────────────────────────────────────
+    #   Hard dependency: produces simulated_returns.npz, which every CVaR consumer
+    #   needs. Runs AFTER Module 1 (uses its betas / factor covariance / residual
+    #   pools and the risk-free rate) and BEFORE the first CVaR consumer (Module 2
+    #   Goal 3). Placed after the Module 1 retry loop so it reflects the FINAL
+    #   ticker set.
+    sim_result = run_subprocess(
+        "Layer 4", "simulation_engine.py",
+        "Monte Carlo scenario engine -> simulated_returns.npz",
+    )
+    if sim_result is False:
+        _fail("Pipeline", "Layer 4 simulation failed -- CVaR consumers (Module 2 "
+              "Goal 3) cannot run without simulated_returns.npz")
+        return
+
+    # Guard: scenarios must exist and be newer than Module 1's outputs before any
+    # CVaR consumer runs (mirrors module2's own "run simulation first" guard).
+    fresh, why = simulation_is_fresh()
+    if not fresh:
+        _fail("Pipeline",
+              f"Cannot proceed to CVaR consumers: {why}. "
+              "Run simulation_engine.py (Layer 4) after Module 1 and before Module 2.")
+        return
+
+    # ── MODULE 2 -- Optimisation (Layer 3 goals + Goal 3 CVaR over Layer 4) ────
     if not run_subprocess(
         "Module 2", "module2_optimiser.py", "Mean-variance optimisation"
     ):
         _fail("Pipeline", "Module 2 failed -- cannot continue")
         return
+
+    # ── LAYER 7 -- Resampling (CANONICAL weights) ─────────────────────────────
+    #   Reuses the simulation's recorded seed so the whole stochastic pipeline is
+    #   reproducible from one seed. Adds ~3-4 min (B=500 x three goals).
+    base_seed = simulation_seed()
+    if not run_layer7(base_seed):
+        _fail("Pipeline", "Layer 7 resampling failed -- cannot produce canonical weights")
+        return
+
+    # ── LAYER 5 -- Risk evaluation (resampled goals + current holdings) ───────
+    if not run_layer5(inputs, base_seed):
+        _warn("Layer 5 risk evaluation failed -- continuing (rebalancing unaffected).")
 
     # ── MODULE 3 -- Efficient frontier ────────────────────────────────────────
     if not run_subprocess(

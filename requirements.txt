@@ -1,7 +1,22 @@
-streamlit>=1.32.0
-pandas>=2.0.0
-numpy>=1.26.0
-scipy>=1.11.0
-matplotlib>=3.8.0
-yfinance>=0.2.40
-openpyxl>=3.1.0
+# Core data / numerics
+numpy>=2.1,<3
+pandas>=2.1,<3
+scipy>=1.13,<2
+
+# Covariance: canonical Ledoit-Wolf (module1_data has a numpy fallback if absent)
+scikit-learn>=1.5,<2
+
+# Plotting (efficient frontier PNG)
+matplotlib>=3.8,<4
+
+# Excel read/write (pandas does not bundle this)
+openpyxl>=3.1,<4
+
+# Market data
+yfinance>=0.2.40,<0.3
+
+# Web UI
+streamlit>=1.32,<2
+
+# HTTP (used by fetch_companies.py helper)
+requests>=2.31,<3
