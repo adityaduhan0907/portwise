@@ -17,6 +17,8 @@ Pipeline
                          -> risk_evaluation_summary.json
   module3_frontier    -> efficient frontier chart
   module4_rebalance   -> rebalancing plan (targets = resampled weights; single-shot fallback)
+  robustness_checks   -> Layer 6 robustness annotations (momentum / correlation /
+                         sector) over the CHOSEN resampled weights -> robustness_warnings.json
   module5_report      -> HTML report (skipped gracefully if file not found)
 
 NOTES
@@ -821,6 +823,7 @@ def print_end_summary(inputs, rebalance_stats, today_str):
         "risk_evaluation_summary.json",
         "efficient_frontier.png",
         f"rebalancing_plan_{date_stamp}.xlsx",
+        "robustness_warnings.json",
         f"portfolio_report_{date_stamp}.html",
     ]
     for fname in expected_files:
@@ -841,7 +844,7 @@ def main():
     print(f"  {today_str}")
     print(_bar("="))
     print("  Pipeline: module0 -> module1 -> simulation -> module2 -> resample(L7)"
-          " -> riskeval(L5) -> module3 -> module4 -> module5")
+          " -> riskeval(L5) -> module3 -> module4 -> robustness(L6) -> module5")
 
     # ── Data freshness check (before collecting inputs) ────────────────────────
     prices_path = os.path.join(SCRIPT_DIR, "prices.xlsx")
@@ -1009,6 +1012,18 @@ def main():
         rebalance_stats = run_module4(inputs, today_str)
     else:
         _warn("No portfolio choice available -- Module 4 skipped.")
+
+    # ── LAYER 6 -- Robustness checks (non-blocking annotations) ───────────────
+    #   Runs after the portfolio is chosen and stabilised (Layer 7 weights +
+    #   Layer 5 risk). It reads the CHOSEN resampled weights, so the portfolio
+    #   choice must be persisted to run_config.json first (it may have been
+    #   selected after Module 3, leaving the on-disk config stale). Produces
+    #   robustness_warnings.json, which Module 5 reads. Never halts the pipeline.
+    write_run_config(inputs)
+    run_subprocess(
+        "Layer 6", "robustness_checks.py",
+        "Robustness checks (momentum / correlation / sector) -> robustness_warnings.json",
+    )
 
     # ── MODULE 5 -- HTML report (optional) ────────────────────────────────────
     result5 = run_subprocess(

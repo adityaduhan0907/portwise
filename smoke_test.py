@@ -198,6 +198,7 @@ def main():
         ("5  Layer 5 (risk eval)",    "[OK] Layer 5 complete"),
         ("3  Module 3 (frontier)",    "[OK] Module 3 complete"),
         ("4  Module 4 (rebalancing)", "[OK] Module 4"),
+        ("6  Layer 6 (robustness)",   "[OK] Layer 6 complete"),
     ]
     print("  PER-STEP RESULT")
     for label, marker in steps:
@@ -245,6 +246,28 @@ def main():
     else:
         print("    [FAIL] risk_evaluation_summary.json not found")
 
+    # 3b. Layer 6 robustness checks ----------------------------------------------
+    print(f"\n  LAYER 6 OUTPUT (robustness_warnings.json)  [chosen goal: '{CHOSEN_GOAL}']")
+    rob_path = os.path.join(SCRIPT_DIR, "robustness_warnings.json")
+    if os.path.exists(rob_path):
+        rob = json.load(open(rob_path, encoding="utf-8"))
+        print(f"    keys ({len(rob)}): {list(rob.keys())}")
+        for key in ("negative_momentum", "high_correlation", "sector_concentration"):
+            c = rob.get(key, {})
+            tag = "FLAGGED" if c.get("triggered") else "clear"
+            print(f"    - {key:<22} [{tag}]")
+            print(f"        {c.get('message', '<no message>')}")
+        # Spot-check: momentum signs vs returns_stats, sector weights sum to ~100%
+        sc = rob.get("sector_concentration", {})
+        sw = sc.get("sector_weights", {})
+        ssum = sum(sw.values()) if sw else float("nan")
+        print(f"    sector weights sum: {ssum * 100:.2f}%   "
+              f"largest: {sc.get('largest_sector')} = "
+              f"{sc.get('largest_share', float('nan')) * 100:.2f}%   "
+              f"eff. sectors: {sc.get('effective_sectors', float('nan')):.2f}")
+    else:
+        print("    [FAIL] robustness_warnings.json not found")
+
     # 4. Canonical-weights check -------------------------------------------------
     print(f"\n  CANONICAL-WEIGHTS CHECK  (chosen goal: '{CHOSEN_GOAL}')")
     plan = _latest_plan()
@@ -270,15 +293,29 @@ def main():
                 "holdings": [{"ticker": t, "shares": float(s)} for t, s in HOLDINGS]}
     today_str = date.today().isoformat()
     hidden = resampled_path + ".hidden"
+
+    def _rename_retry(src, dst, attempts=10):
+        """Windows can briefly hold an xlsx handle after pandas reads it;
+        gc + short retries release it without failing the whole report."""
+        import gc
+        for i in range(attempts):
+            try:
+                os.rename(src, dst)
+                return
+            except PermissionError:
+                gc.collect()
+                time.sleep(0.5)
+        os.rename(src, dst)   # final attempt; raise if still locked
+
     try:
-        os.rename(resampled_path, hidden)
+        _rename_retry(resampled_path, hidden)
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             fb_stats = run_all.run_module4(dict(fb_input), today_str)
         fb_out = buf.getvalue()
     finally:
         if os.path.exists(hidden):
-            os.rename(hidden, resampled_path)
+            _rename_retry(hidden, resampled_path)
     warned   = "falling back to single-shot" in fb_out
     produced = fb_stats is not None
     print(f"    warning printed: {warned}   |   plan still produced (no crash): {produced}")

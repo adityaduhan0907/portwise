@@ -235,6 +235,8 @@ resampled_portfolios.xlsx
 resampled_weights.npz
 risk_evaluation_summary.json
 rebalancing_plan_*.xlsx
+robustness_warnings.json
+sectors.json
 
 # Harness / test artifacts
 smoke_test_run.log
@@ -244,3 +246,5 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+robustness_warnings.json
+sectors.json

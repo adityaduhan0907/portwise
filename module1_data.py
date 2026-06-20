@@ -48,6 +48,9 @@ SCRIPT_DIR        = os.path.dirname(os.path.abspath(__file__))
 # ── Factor-model data source ────────────────────────────────────────────────────
 DATA_POINTS_PATH = os.path.join(SCRIPT_DIR, "data_points.xlsx")
 
+# ── Sector handoff (here -> robustness_checks Layer-6 concentration check) ───────
+SECTORS_PATH     = os.path.join(SCRIPT_DIR, "sectors.json")  # {ticker: sector}
+
 # ── Factor-history handoff (from module 0) + residual handoff (to Part B / Layer 4)
 FACTOR_HISTORY_PATH   = os.path.join(SCRIPT_DIR, "factor_history.json")    # module0 -> here
 FACTOR_RESIDUALS_PATH = os.path.join(SCRIPT_DIR, "factor_residuals.json")  # here -> Part B
@@ -357,9 +360,12 @@ def _factor_expected_return(is_india, market_cap, pb, model):
 
 def _fetch_cap_pb(ticker, max_retries=3, delay=1):
     """
-    Fetch (marketCap, priceToBook) from yfinance ticker.info.
+    Fetch (marketCap, priceToBook, sector) from yfinance ticker.info.
     If priceToBook is missing, compute currentPrice / bookValue.
-    Returns (market_cap_or_None, pb_or_None).
+    Sector is captured from the same single info fetch (no extra request) so
+    the Layer-6 robustness sector-concentration check has a data source; a
+    missing/blank sector is returned as None (callers map it to "Unknown").
+    Returns (market_cap_or_None, pb_or_None, sector_or_None).
     """
     info = {}
     for attempt in range(max_retries):
@@ -380,7 +386,13 @@ def _fetch_cap_pb(ticker, max_retries=3, delay=1):
         bv = _to_float(info.get("bookValue"))
         if cp is not None and bv not in (None, 0):
             pb = cp / bv
-    return market_cap, pb
+
+    sector = info.get("sector")
+    if isinstance(sector, str):
+        sector = sector.strip() or None
+    else:
+        sector = None
+    return market_cap, pb, sector
 
 
 def calculate_capm_returns(tickers, rf_usa):
@@ -404,7 +416,7 @@ def calculate_capm_returns(tickers, rf_usa):
     results = {}
     for ticker in tickers:
         is_india = ticker.upper().endswith((".NS", ".BO"))
-        market_cap, pb = _fetch_cap_pb(ticker)
+        market_cap, pb, sector = _fetch_cap_pb(ticker)
         comp = _factor_expected_return(is_india, market_cap, pb, model)
         results[ticker] = {
             "beta":            comp["beta_mkt"],
@@ -415,6 +427,7 @@ def calculate_capm_returns(tickers, rf_usa):
             "column":          comp["column"],
             "bucket":          comp["bucket"],
             "betas_by_factor": comp["betas_by_factor"],
+            "sector":          sector if sector else "Unknown",
         }
     return results
 
@@ -848,6 +861,19 @@ def main():
         print(f"    {s:<22}  [{v['market']:5}]  beta={v['beta']:.3f}  "
               f"Rf={v['rf']*100:.2f}%  ERP={v['erp']*100:.2f}%  "
               f"E[r]={v['expected_return']*100:>7.2f}%")
+
+    # Persist ticker -> sector for the Layer-6 robustness concentration check.
+    # Captured from the same ticker.info fetch above (marketCap / priceToBook);
+    # unresolved sectors are stored as "Unknown".
+    sectors_map = {t: v.get("sector", "Unknown") for t, v in capm_results.items()}
+    try:
+        with open(SECTORS_PATH, "w", encoding="utf-8") as f:
+            json.dump(sectors_map, f, indent=2)
+        n_unknown = sum(1 for s in sectors_map.values() if s == "Unknown")
+        print(f"  Sectors saved -> sectors.json  ({len(sectors_map)} tickers, "
+              f"{n_unknown} Unknown)")
+    except Exception as exc:
+        print(f"  WARNING: could not write sectors.json ({exc}).")
 
     capm_df = pd.DataFrame([
         {
