@@ -66,6 +66,15 @@ _SKIP_LABELS = {
 }
 
 
+class PipelineError(RuntimeError):
+    """Hard failure that stops the pipeline.
+
+    run_pipeline() raises this at each fatal step. The terminal main() catches it and
+    prints a [FAIL] line (preserving today's behaviour), while programmatic callers
+    (e.g. app.py) can catch it to show a friendly error instead of a traceback.
+    """
+
+
 # ── Terminal helpers ───────────────────────────────────────────────────────────
 
 def _bar(char="="):
@@ -530,11 +539,14 @@ def run_layer5(inputs, base_seed):
 
 # ── Robustness checks ──────────────────────────────────────────────────────────
 
-def check_momentum(inputs):
+def check_momentum(inputs, interactive=True):
     """
     Read 'Annualised Mu' from returns_stats.xlsx.
     For each ticker with a negative momentum return, warn the user and
     optionally remove it from the ticker list.
+
+    When interactive=False the warning is still printed but the ticker is KEPT
+    (no prompt), so the pipeline can run unattended (e.g. from app.py).
 
     Returns a list of removed tickers (empty if none removed).
     """
@@ -557,6 +569,9 @@ def check_momentum(inputs):
         if ret < 0:
             print(f"\n  [WARN] {ticker} has negative momentum "
                   f"({ret * 100:.2f}%) over the 11-month window.")
+            if not interactive:
+                print(f"  [non-interactive] Keeping {ticker} in the optimisation.")
+                continue
             resp = input(
                 f"  Include {ticker} in the optimisation anyway? [yes/no]: "
             ).strip().lower()
@@ -660,10 +675,14 @@ def check_concentration(inputs):
 
 # ── Module 4 — non-interactive execution ──────────────────────────────────────
 
-def run_module4(inputs, today_str):
+def run_module4(inputs, today_str, interactive=True):
     """
     Run the rebalancing analysis without interactive prompts by calling
     module4_rebalance's helper functions directly with the pre-collected inputs.
+
+    If the supplied portfolio_choice is missing/invalid: interactive=True asks the
+    user to pick (today's behaviour); interactive=False defaults to the first
+    available portfolio so the run can proceed unattended.
 
     Returns a dict of rebalancing stats for the end summary, or None on failure.
     """
@@ -739,16 +758,24 @@ def run_module4(inputs, today_str):
     choice = inputs.get("portfolio_choice")
 
     if not choice or choice not in portfolio_opts:
-        if choice:
-            _warn(
-                f"Previous portfolio choice '{choice}' is not available "
-                "in the current optimisation. Please choose again."
-            )
-        print(f"\n{_bar()}")
-        print("  SELECT TARGET PORTFOLIO FOR REBALANCING")
-        print(_bar())
-        choice = _ask_portfolio_choice(portfolio_opts)
-        inputs["portfolio_choice"] = choice
+        if not interactive:
+            if choice:
+                _warn(f"Portfolio choice '{choice}' not available in the current "
+                      "optimisation; defaulting to the first option.")
+            choice = next(iter(portfolio_opts))
+            inputs["portfolio_choice"] = choice
+            print(f"  Non-interactive: using portfolio '{choice}'.")
+        else:
+            if choice:
+                _warn(
+                    f"Previous portfolio choice '{choice}' is not available "
+                    "in the current optimisation. Please choose again."
+                )
+            print(f"\n{_bar()}")
+            print("  SELECT TARGET PORTFOLIO FOR REBALANCING")
+            print(_bar())
+            choice = _ask_portfolio_choice(portfolio_opts)
+            inputs["portfolio_choice"] = choice
 
     target_weights = portfolio_opts[choice]
 
@@ -868,7 +895,227 @@ def print_end_summary(inputs, rebalance_stats, today_str):
 
 # ── Main pipeline ──────────────────────────────────────────────────────────────
 
+def run_pipeline(tickers, holdings, currency, portfolio_choice,
+                 benchmark="^GSPC", interactive=False, today_str=None):
+    """
+    Programmatic entry point for the whole pipeline.
+
+    Runs the SAME orchestration (in the SAME order) as the interactive terminal flow
+    --  module0 -> module1 -> simulation(L4) -> module2 -> resampling(L7) ->
+    riskeval(L5) -> module3 -> robustness checks -> module4 -> robustness(L6) ->
+    module5 -> end summary  --  but with the four user inputs supplied as arguments
+    instead of being collected via input(). Module internals and step order are
+    unchanged; only how the inputs arrive differs.
+
+    Parameters
+    ----------
+    tickers          : list[str]   tickers to optimise over (incl. any to-add names)
+    holdings         : list[dict]  current holdings, each {"ticker": str, "shares": float}
+    currency         : str         "USD" or "INR" (display only)
+    portfolio_choice : str | None  chosen goal SHEET name ("Minimum Variance" /
+                                    "Max Risk-Adjusted" / "Tail-Risk CVaR"). None defers
+                                    the choice (Layer 7 then resamples all three goals as
+                                    the fallback, and the choice is resolved before Module 4).
+    benchmark        : str         benchmark ticker (report context only)
+    interactive      : bool        True only for the terminal flow -- enables the
+                                    momentum-removal and portfolio-reselection prompts.
+                                    False (default) runs fully unattended with safe
+                                    defaults (keep flagged tickers; first goal if needed).
+    today_str        : str | None  date stamp; defaults to today.
+
+    Returns a summary dict on success. Raises PipelineError on any hard failure.
+    """
+    if today_str is None:
+        today_str = datetime.now().strftime("%Y-%m-%d")
+
+    inputs = {
+        "tickers":          list(tickers),
+        "benchmark":        benchmark,
+        "currency":         currency,
+        "holdings":         list(holdings),
+        "portfolio_choice": portfolio_choice,
+    }
+
+    rebalance_stats = None    # populated after module4 runs
+
+    # ── Write run_config.json (modules 0 and 1 will read it) ──────────────────
+    write_run_config(inputs)
+    print(f"\n  Run configuration saved to run_config.json")
+
+    # ── MODULE 0 -- Risk-free rates ────────────────────────────────────────────
+    if not run_subprocess(
+        "Module 0", "module0_riskfree.py", "Fetching live risk-free rates"
+    ):
+        raise PipelineError("Module 0 failed -- cannot continue without risk-free rates")
+
+    # ── MODULE 1 -- Prices & returns  (with momentum retry loop) ──────────────
+    MAX_RETRIES = 3
+    for attempt in range(MAX_RETRIES):
+        # Refresh config in case tickers were trimmed in a previous iteration
+        write_run_config(inputs)
+
+        label = "Module 1" if attempt == 0 else f"Module 1 (retry {attempt})"
+        if not run_subprocess(
+            label, "module1_data.py",
+            "Downloading prices, momentum returns, long-run covariance",
+        ):
+            raise PipelineError("Module 1 failed -- cannot continue")
+
+        # -- Momentum robustness check --
+        print(f"\n{_bar()}")
+        print("  ROBUSTNESS CHECK 1 of 3  --  Momentum")
+        print(_bar())
+        removed = check_momentum(inputs, interactive=interactive)
+
+        # -- Correlation robustness check (only once per module1 run) --
+        print(f"\n{_bar()}")
+        print("  ROBUSTNESS CHECK 2 of 3  --  Correlation")
+        print(_bar())
+        check_correlation(inputs)
+
+        if not removed:
+            break    # no tickers dropped; proceed to module2
+
+        remaining = len(inputs["tickers"])
+        if remaining < 3:
+            raise PipelineError(
+                f"Only {remaining} ticker(s) remain after removal -- "
+                "need at least 3. Please restart with a broader list."
+            )
+
+        print(
+            f"\n  Re-running Module 1 with updated tickers: "
+            f"{', '.join(inputs['tickers'])}"
+        )
+    else:
+        _warn(
+            f"Maximum retries ({MAX_RETRIES}) reached for ticker removal. "
+            "Proceeding with remaining tickers."
+        )
+
+    # ── LAYER 4 -- Monte Carlo simulation ─────────────────────────────────────
+    #   Hard dependency: produces simulated_returns.npz, which every CVaR consumer
+    #   needs. Runs AFTER Module 1 (uses its betas / factor covariance / residual
+    #   pools and the risk-free rate) and BEFORE the first CVaR consumer (Module 2
+    #   Goal 3). Placed after the Module 1 retry loop so it reflects the FINAL
+    #   ticker set.
+    sim_result = run_subprocess(
+        "Layer 4", "simulation_engine.py",
+        "Monte Carlo scenario engine -> simulated_returns.npz",
+    )
+    if sim_result is False:
+        raise PipelineError("Layer 4 simulation failed -- CVaR consumers (Module 2 "
+                            "Goal 3) cannot run without simulated_returns.npz")
+
+    # Guard: scenarios must exist and be newer than Module 1's outputs before any
+    # CVaR consumer runs (mirrors module2's own "run simulation first" guard).
+    fresh, why = simulation_is_fresh()
+    if not fresh:
+        raise PipelineError(
+            f"Cannot proceed to CVaR consumers: {why}. "
+            "Run simulation_engine.py (Layer 4) after Module 1 and before Module 2.")
+
+    # ── MODULE 2 -- Optimisation (Layer 3 goals + Goal 3 CVaR over Layer 4) ────
+    if not run_subprocess(
+        "Module 2", "module2_optimiser.py", "Mean-variance optimisation"
+    ):
+        raise PipelineError("Module 2 failed -- cannot continue")
+
+    # ── LAYER 7 -- Resampling (chosen goal -> CANONICAL weights) ──────────────
+    #   Reuses the simulation's recorded seed so the whole stochastic pipeline is
+    #   reproducible from one seed. Resamples ONLY the chosen goal (B=500), so this
+    #   is ~1/3 the cost when the choice is known up front.
+    base_seed = simulation_seed()
+    if not run_layer7(base_seed, inputs.get("portfolio_choice")):
+        raise PipelineError("Layer 7 resampling failed -- cannot produce canonical weights")
+
+    # ── LAYER 5 -- Risk evaluation (resampled goals + current holdings) ───────
+    if not run_layer5(inputs, base_seed):
+        _warn("Layer 5 risk evaluation failed -- continuing (rebalancing unaffected).")
+
+    # ── MODULE 3 -- Efficient frontier ────────────────────────────────────────
+    if not run_subprocess(
+        "Module 3", "module3_frontier.py", "Efficient frontier chart"
+    ):
+        raise PipelineError("Module 3 failed -- cannot continue")
+
+    # -- Concentration robustness check (portfolios now finalised) --
+    print(f"\n{_bar()}")
+    print("  ROBUSTNESS CHECK 3 of 3  --  Country Concentration")
+    print(_bar())
+    check_concentration(inputs)
+
+    # -- Portfolio choice (if not supplied up front) --
+    if not inputs.get("portfolio_choice"):
+        portfolios_path = os.path.join(SCRIPT_DIR, "optimised_portfolios.xlsx")
+        opts = _load_portfolio_opts(portfolios_path)
+        if opts:
+            if interactive:
+                print(f"\n{_bar()}")
+                print("  SELECT TARGET PORTFOLIO FOR REBALANCING")
+                print(_bar())
+                inputs["portfolio_choice"] = _ask_portfolio_choice(opts)
+            else:
+                inputs["portfolio_choice"] = next(iter(opts))
+                print(f"\n  Non-interactive: defaulting portfolio choice to "
+                      f"'{inputs['portfolio_choice']}'.")
+        else:
+            _warn(
+                "Could not load portfolio options -- skipping Module 4."
+            )
+
+    # ── MODULE 4 -- Rebalancing (non-interactive) ─────────────────────────────
+    if inputs.get("portfolio_choice"):
+        rebalance_stats = run_module4(inputs, today_str, interactive=interactive)
+    else:
+        _warn("No portfolio choice available -- Module 4 skipped.")
+
+    # ── LAYER 6 -- Robustness checks (non-blocking annotations) ───────────────
+    #   Runs after the portfolio is chosen and stabilised (Layer 7 weights +
+    #   Layer 5 risk). It reads the CHOSEN resampled weights, so the portfolio
+    #   choice must be persisted to run_config.json first (it may have been
+    #   selected after Module 3, leaving the on-disk config stale). Produces
+    #   robustness_warnings.json, which Module 5 reads. Never halts the pipeline.
+    write_run_config(inputs)
+    run_subprocess(
+        "Layer 6", "robustness_checks.py",
+        "Robustness checks (momentum / correlation / sector) -> robustness_warnings.json",
+    )
+
+    # ── MODULE 5 -- Markdown report (optional) ────────────────────────────────
+    #   Reads run_config.json (portfolio_choice / holdings / currency, persisted
+    #   before Layer 6) plus the upstream artifacts; emits portfolio_report_*.md.
+    result5 = run_subprocess(
+        "Module 5", "module5_report.py", "Plain-language Markdown portfolio report"
+    )
+    if result5 is None:
+        print(
+            "  [NOTE] module5_report.py was not found -- report skipped."
+        )
+        print(
+            "         Build module5_report.py to enable this step."
+        )
+
+    # ── End summary ───────────────────────────────────────────────────────────
+    print_end_summary(inputs, rebalance_stats, today_str)
+
+    # Clean up the run config file now that the pipeline is complete
+    try:
+        os.remove(CONFIG_PATH)
+    except Exception:
+        pass
+
+    return {
+        "success":          True,
+        "portfolio_choice": inputs.get("portfolio_choice"),
+        "tickers":          inputs["tickers"],
+        "currency":         currency,
+        "rebalance_stats":  rebalance_stats,
+    }
+
+
 def main():
+    """Interactive terminal entry point: collect the inputs, then drive run_pipeline."""
     today_str = datetime.now().strftime("%Y-%m-%d")
 
     print(f"\n{_bar('=')}")
@@ -908,178 +1155,20 @@ def main():
     # ── Confirm before starting ────────────────────────────────────────────────
     confirm_inputs(inputs)
 
-    # ── Write run_config.json (modules 0 and 1 will read it) ──────────────────
-    write_run_config(inputs)
-    print(f"\n  Run configuration saved to run_config.json")
-
-    rebalance_stats = None    # populated after module4 runs
-
-    # ── MODULE 0 -- Risk-free rates ────────────────────────────────────────────
-    if not run_subprocess(
-        "Module 0", "module0_riskfree.py", "Fetching live risk-free rates"
-    ):
-        _fail("Pipeline", "Module 0 failed -- cannot continue without risk-free rates")
-        return
-
-    # ── MODULE 1 -- Prices & returns  (with momentum retry loop) ──────────────
-    MAX_RETRIES = 3
-    for attempt in range(MAX_RETRIES):
-        # Refresh config in case tickers were trimmed in a previous iteration
-        write_run_config(inputs)
-
-        label = "Module 1" if attempt == 0 else f"Module 1 (retry {attempt})"
-        if not run_subprocess(
-            label, "module1_data.py",
-            "Downloading prices, momentum returns, long-run covariance",
-        ):
-            _fail("Pipeline", "Module 1 failed -- cannot continue")
-            return
-
-        # -- Momentum robustness check --
-        print(f"\n{_bar()}")
-        print("  ROBUSTNESS CHECK 1 of 3  --  Momentum")
-        print(_bar())
-        removed = check_momentum(inputs)
-
-        # -- Correlation robustness check (only once per module1 run) --
-        print(f"\n{_bar()}")
-        print("  ROBUSTNESS CHECK 2 of 3  --  Correlation")
-        print(_bar())
-        check_correlation(inputs)
-
-        if not removed:
-            break    # no tickers dropped; proceed to module2
-
-        remaining = len(inputs["tickers"])
-        if remaining < 3:
-            _fail(
-                "Pipeline",
-                f"Only {remaining} ticker(s) remain after removal -- "
-                "need at least 3. Please restart with a broader list.",
-            )
-            return
-
-        print(
-            f"\n  Re-running Module 1 with updated tickers: "
-            f"{', '.join(inputs['tickers'])}"
-        )
-    else:
-        _warn(
-            f"Maximum retries ({MAX_RETRIES}) reached for ticker removal. "
-            "Proceeding with remaining tickers."
-        )
-
-    # ── LAYER 4 -- Monte Carlo simulation ─────────────────────────────────────
-    #   Hard dependency: produces simulated_returns.npz, which every CVaR consumer
-    #   needs. Runs AFTER Module 1 (uses its betas / factor covariance / residual
-    #   pools and the risk-free rate) and BEFORE the first CVaR consumer (Module 2
-    #   Goal 3). Placed after the Module 1 retry loop so it reflects the FINAL
-    #   ticker set.
-    sim_result = run_subprocess(
-        "Layer 4", "simulation_engine.py",
-        "Monte Carlo scenario engine -> simulated_returns.npz",
-    )
-    if sim_result is False:
-        _fail("Pipeline", "Layer 4 simulation failed -- CVaR consumers (Module 2 "
-              "Goal 3) cannot run without simulated_returns.npz")
-        return
-
-    # Guard: scenarios must exist and be newer than Module 1's outputs before any
-    # CVaR consumer runs (mirrors module2's own "run simulation first" guard).
-    fresh, why = simulation_is_fresh()
-    if not fresh:
-        _fail("Pipeline",
-              f"Cannot proceed to CVaR consumers: {why}. "
-              "Run simulation_engine.py (Layer 4) after Module 1 and before Module 2.")
-        return
-
-    # ── MODULE 2 -- Optimisation (Layer 3 goals + Goal 3 CVaR over Layer 4) ────
-    if not run_subprocess(
-        "Module 2", "module2_optimiser.py", "Mean-variance optimisation"
-    ):
-        _fail("Pipeline", "Module 2 failed -- cannot continue")
-        return
-
-    # ── LAYER 7 -- Resampling (chosen goal -> CANONICAL weights) ──────────────
-    #   Reuses the simulation's recorded seed so the whole stochastic pipeline is
-    #   reproducible from one seed. Resamples ONLY the chosen goal (B=500), so this
-    #   is ~1/3 the cost when the choice is known up front.
-    base_seed = simulation_seed()
-    if not run_layer7(base_seed, inputs.get("portfolio_choice")):
-        _fail("Pipeline", "Layer 7 resampling failed -- cannot produce canonical weights")
-        return
-
-    # ── LAYER 5 -- Risk evaluation (resampled goals + current holdings) ───────
-    if not run_layer5(inputs, base_seed):
-        _warn("Layer 5 risk evaluation failed -- continuing (rebalancing unaffected).")
-
-    # ── MODULE 3 -- Efficient frontier ────────────────────────────────────────
-    if not run_subprocess(
-        "Module 3", "module3_frontier.py", "Efficient frontier chart"
-    ):
-        _fail("Pipeline", "Module 3 failed -- cannot continue")
-        return
-
-    # -- Concentration robustness check (portfolios now finalised) --
-    print(f"\n{_bar()}")
-    print("  ROBUSTNESS CHECK 3 of 3  --  Country Concentration")
-    print(_bar())
-    check_concentration(inputs)
-
-    # -- Portfolio choice (if not collected upfront) --
-    if not inputs.get("portfolio_choice"):
-        portfolios_path = os.path.join(SCRIPT_DIR, "optimised_portfolios.xlsx")
-        opts = _load_portfolio_opts(portfolios_path)
-        if opts:
-            print(f"\n{_bar()}")
-            print("  SELECT TARGET PORTFOLIO FOR REBALANCING")
-            print(_bar())
-            inputs["portfolio_choice"] = _ask_portfolio_choice(opts)
-        else:
-            _warn(
-                "Could not load portfolio options -- skipping Module 4."
-            )
-
-    # ── MODULE 4 -- Rebalancing (non-interactive) ─────────────────────────────
-    if inputs.get("portfolio_choice"):
-        rebalance_stats = run_module4(inputs, today_str)
-    else:
-        _warn("No portfolio choice available -- Module 4 skipped.")
-
-    # ── LAYER 6 -- Robustness checks (non-blocking annotations) ───────────────
-    #   Runs after the portfolio is chosen and stabilised (Layer 7 weights +
-    #   Layer 5 risk). It reads the CHOSEN resampled weights, so the portfolio
-    #   choice must be persisted to run_config.json first (it may have been
-    #   selected after Module 3, leaving the on-disk config stale). Produces
-    #   robustness_warnings.json, which Module 5 reads. Never halts the pipeline.
-    write_run_config(inputs)
-    run_subprocess(
-        "Layer 6", "robustness_checks.py",
-        "Robustness checks (momentum / correlation / sector) -> robustness_warnings.json",
-    )
-
-    # ── MODULE 5 -- Markdown report (optional) ────────────────────────────────
-    #   Reads run_config.json (portfolio_choice / holdings / currency, persisted
-    #   before Layer 6) plus the upstream artifacts; emits portfolio_report_*.md.
-    result5 = run_subprocess(
-        "Module 5", "module5_report.py", "Plain-language Markdown portfolio report"
-    )
-    if result5 is None:
-        print(
-            "  [NOTE] module5_report.py was not found -- report skipped."
-        )
-        print(
-            "         Build module5_report.py to enable this step."
-        )
-
-    # ── End summary ───────────────────────────────────────────────────────────
-    print_end_summary(inputs, rebalance_stats, today_str)
-
-    # Clean up the run config file now that the pipeline is complete
+    # ── Drive the pipeline with the collected inputs (interactive prompts ON) ──
     try:
-        os.remove(CONFIG_PATH)
-    except Exception:
-        pass
+        run_pipeline(
+            tickers=inputs["tickers"],
+            holdings=inputs.get("holdings", []),
+            currency=inputs.get("currency", "USD"),
+            portfolio_choice=inputs.get("portfolio_choice"),
+            benchmark=inputs.get("benchmark", "^GSPC"),
+            interactive=True,
+            today_str=today_str,
+        )
+    except PipelineError as exc:
+        _fail("Pipeline", str(exc))
+        return
 
 
 if __name__ == "__main__":
