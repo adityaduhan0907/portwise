@@ -25,9 +25,10 @@ OUTPUTS
 import json
 import math
 import os
+import pickle
 import time
 import warnings
-from datetime import date
+from datetime import date, datetime
 
 import numpy as np
 import pandas as pd
@@ -43,7 +44,11 @@ LONGRUN_YEARS     = 10
 SKIP_RECENT       = 1      # months to skip at near end (short-term reversal)
 MOM_WINDOW        = 11     # holding-period months = 12 − 1
 MIN_DATA_FRAC     = 0.70
+PRICES_MAX_AGE_HRS = 24     # reuse cached raw price history if younger than this
 SCRIPT_DIR        = os.path.dirname(os.path.abspath(__file__))
+
+# ── Raw price-history cache (avoids re-fetching yfinance within PRICES_MAX_AGE_HRS) ─
+PRICES_CACHE_PATH = os.path.join(SCRIPT_DIR, "prices_cache.pkl")
 
 # ── Factor-model data source ────────────────────────────────────────────────────
 DATA_POINTS_PATH = os.path.join(SCRIPT_DIR, "data_points.xlsx")
@@ -702,6 +707,91 @@ def write_residuals_handoff(F_by_market, asset_residuals, generated_at,
     return path
 
 
+# ── Raw price-history cache ─────────────────────────────────────────────────────
+#   Caches the three raw per-symbol price dicts (daily / momentum-monthly /
+#   long-run-monthly) that EVERYTHING module 1 derives from -- the 3y daily
+#   prices.xlsx, the momentum window, and the 10y monthly covariance returns -- plus
+#   a timestamp and the requested-ticker set so freshness (< PRICES_MAX_AGE_HRS) and
+#   coverage (cache covers all requested tickers) can be checked. Analysis math is
+#   unchanged; this only avoids the network fetch when a fresh cache already covers
+#   the requested tickers.
+
+def _load_price_cache(path=PRICES_CACHE_PATH):
+    """Load the price cache (or None if absent/unreadable)."""
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "rb") as f:
+            return pickle.load(f)
+    except Exception as exc:
+        print(f"  WARNING: could not read price cache ({exc}); will download.")
+        return None
+
+
+def _cache_age_hours(cache):
+    """Hours since the cache was downloaded (inf if unknown)."""
+    try:
+        dt = datetime.fromisoformat(cache["downloaded_at"])
+        return (datetime.now() - dt).total_seconds() / 3600.0
+    except Exception:
+        return float("inf")
+
+
+def _cache_usable(cache, tickers):
+    """
+    True if the cache is fresh (< PRICES_MAX_AGE_HRS) AND covers every requested
+    ticker (the cached requested set is a superset of the current request).
+    """
+    if not cache:
+        return False, "no cache"
+    age = _cache_age_hours(cache)
+    if age > PRICES_MAX_AGE_HRS:
+        return False, f"stale ({age:.1f}h > {PRICES_MAX_AGE_HRS}h)"
+    cached_req = set(cache.get("requested_tickers", []))
+    requested  = {t.strip().upper() for t in tickers}
+    if not requested.issubset(cached_req):
+        missing = sorted(requested - cached_req)
+        return False, f"missing tickers {missing}"
+    return True, f"{age:.1f}h"
+
+
+def _slice_cache(cache, tickers):
+    """
+    Reconstruct (daily_prices, mom_prices, cov_prices, failed) limited to the
+    requested tickers from a usable cache. Keyed by resolved symbol, as the fetch
+    loop would have produced.
+    """
+    requested = [t.strip().upper() for t in tickers]
+    t2s = cache.get("ticker_to_symbol", {})
+    symbols = [t2s[t] for t in requested if t in t2s]
+
+    daily = {s: cache["daily_prices"][s] for s in symbols if s in cache["daily_prices"]}
+    mom   = {s: cache["mom_prices"].get(s) for s in symbols}
+    cov   = {s: cache["cov_prices"].get(s) for s in symbols}
+    failed = {t: cache["failed"][t] for t in requested if t in cache.get("failed", {})}
+    return daily, mom, cov, failed
+
+
+def _save_price_cache(daily_prices, mom_prices, cov_prices, failed,
+                      requested_tickers, ticker_to_symbol, path=PRICES_CACHE_PATH):
+    """Persist the raw price dicts + timestamp + ticker set for later reuse."""
+    payload = {
+        "downloaded_at":     datetime.now().isoformat(timespec="seconds"),
+        "requested_tickers": [t.strip().upper() for t in requested_tickers],
+        "ticker_to_symbol":  dict(ticker_to_symbol),
+        "symbols":           list(daily_prices.keys()),
+        "daily_prices":      daily_prices,
+        "mom_prices":        mom_prices,
+        "cov_prices":        cov_prices,
+        "failed":            failed,
+    }
+    try:
+        with open(path, "wb") as f:
+            pickle.dump(payload, f)
+    except Exception as exc:
+        print(f"  WARNING: could not write price cache ({exc}).")
+
+
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def main():
@@ -731,59 +821,73 @@ def main():
     print("        The most recent month is excluded to avoid short-term reversal.")
     print("  NOTE: Risk estimates use 10 years of monthly data for stability.\n")
 
-    # ── 1. Fetch all data ──────────────────────────────────────────────────────
+    # ── 1. Fetch all data (reuse a fresh cache if it covers the tickers) ───────
     daily_prices  = {}   # symbol -> pd.Series (daily)
     mom_prices    = {}   # symbol -> pd.Series (monthly closes, momentum window)
     cov_prices    = {}   # symbol -> pd.Series (monthly closes, long-run)
     failed        = {}   # original ticker -> error message
 
-    for raw in TICKERS:
-        ticker = raw.strip().upper()
-        print(f"  [{ticker}]")
+    cache = _load_price_cache()
+    usable, reason = _cache_usable(cache, TICKERS)
+    if usable:
+        print(f"  Using cached prices (downloaded {reason} ago) -- skipping yfinance download.")
+        daily_prices, mom_prices, cov_prices, failed = _slice_cache(cache, TICKERS)
+    else:
+        print(f"  Downloading fresh prices...  (cache: {reason})")
+        ticker_to_symbol = {}   # requested ticker -> resolved symbol
+        for raw in TICKERS:
+            ticker = raw.strip().upper()
+            print(f"  [{ticker}]")
 
-        # Daily (3 years) -- determines the resolved symbol
-        symbol, daily_s, err = resolve_and_fetch(ticker, daily_start, today, "1d")
-        if err:
-            print(f"    SKIP: {err}")
-            failed[ticker] = err
-            continue
-        if len(daily_s) < min_obs_daily:
-            err = (f"only {len(daily_s)} daily obs, need >= {min_obs_daily} "
-                   f"({MIN_DATA_FRAC:.0%} of {DAILY_YEARS}y)")
-            print(f"    SKIP: {err}")
-            failed[ticker] = err
-            continue
+            # Daily (3 years) -- determines the resolved symbol
+            symbol, daily_s, err = resolve_and_fetch(ticker, daily_start, today, "1d")
+            if err:
+                print(f"    SKIP: {err}")
+                failed[ticker] = err
+                continue
+            if len(daily_s) < min_obs_daily:
+                err = (f"only {len(daily_s)} daily obs, need >= {min_obs_daily} "
+                       f"({MIN_DATA_FRAC:.0%} of {DAILY_YEARS}y)")
+                print(f"    SKIP: {err}")
+                failed[ticker] = err
+                continue
 
-        daily_prices[symbol] = daily_s
-        print(f"    Daily      : {len(daily_s):>4} obs  OK")
+            ticker_to_symbol[ticker] = symbol
+            daily_prices[symbol] = daily_s
+            print(f"    Daily      : {len(daily_s):>4} obs  OK")
 
-        # Momentum monthly (reuse resolved symbol)
-        _, mom_s, err_m = resolve_and_fetch(symbol, mom_start, today, "1mo")
-        if err_m or mom_s is None:
-            print(f"    Momentum   : WARNING -- {err_m or 'no data'}")
-            mom_prices[symbol] = None
-        else:
-            needed = SKIP_RECENT + MOM_WINDOW + 2
-            if len(mom_s) < needed:
-                print(f"    Momentum   : WARNING -- only {len(mom_s)} monthly prices "
-                      f"(need {needed}); momentum return will use fallback")
+            # Momentum monthly (reuse resolved symbol)
+            _, mom_s, err_m = resolve_and_fetch(symbol, mom_start, today, "1mo")
+            if err_m or mom_s is None:
+                print(f"    Momentum   : WARNING -- {err_m or 'no data'}")
+                mom_prices[symbol] = None
             else:
-                print(f"    Momentum   : {len(mom_s):>4} monthly prices  OK")
-            mom_prices[symbol] = mom_s
+                needed = SKIP_RECENT + MOM_WINDOW + 2
+                if len(mom_s) < needed:
+                    print(f"    Momentum   : WARNING -- only {len(mom_s)} monthly prices "
+                          f"(need {needed}); momentum return will use fallback")
+                else:
+                    print(f"    Momentum   : {len(mom_s):>4} monthly prices  OK")
+                mom_prices[symbol] = mom_s
 
-        # Long-run monthly (reuse resolved symbol)
-        _, cov_s, err_c = resolve_and_fetch(symbol, cov_start, today, "1mo")
-        if err_c or cov_s is None:
-            print(f"    Long-run   : WARNING -- {err_c or 'no data'}; will use available data")
-            cov_prices[symbol] = None
-        else:
-            min_cov = int(LONGRUN_YEARS * TRADING_MONTHS * MIN_DATA_FRAC)
-            if len(cov_s) < min_cov:
-                print(f"  WARNING: {symbol} only has {len(cov_s)} months of data. "
-                      f"Using full available history.")
+            # Long-run monthly (reuse resolved symbol)
+            _, cov_s, err_c = resolve_and_fetch(symbol, cov_start, today, "1mo")
+            if err_c or cov_s is None:
+                print(f"    Long-run   : WARNING -- {err_c or 'no data'}; will use available data")
+                cov_prices[symbol] = None
             else:
-                print(f"    Long-run   : {len(cov_s):>4} monthly prices  OK")
-            cov_prices[symbol] = cov_s
+                min_cov = int(LONGRUN_YEARS * TRADING_MONTHS * MIN_DATA_FRAC)
+                if len(cov_s) < min_cov:
+                    print(f"  WARNING: {symbol} only has {len(cov_s)} months of data. "
+                          f"Using full available history.")
+                else:
+                    print(f"    Long-run   : {len(cov_s):>4} monthly prices  OK")
+                cov_prices[symbol] = cov_s
+
+        # Persist the raw history so the next run within PRICES_MAX_AGE_HRS reuses it.
+        if daily_prices:
+            _save_price_cache(daily_prices, mom_prices, cov_prices, failed,
+                              TICKERS, ticker_to_symbol)
 
     if not daily_prices:
         print("\n  No tickers processed successfully. Exiting.\n")

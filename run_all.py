@@ -353,11 +353,17 @@ def simulation_seed(default=None):
 
 # ── Layer 7 -- resampling (reuses resampling_wrapper; logic unchanged) ──────────
 
-def run_layer7(base_seed):
+def run_layer7(base_seed, portfolio_choice=None):
     """
-    Michaud-resample all three goals (B=500) into resampled_portfolios.xlsx, the
-    CANONICAL weights file. Drives resampling_wrapper's public functions in-process
-    so the module's logic is untouched.
+    Michaud-resample (B=500) into resampled_portfolios.xlsx. Resamples ONLY the goal
+    matching `portfolio_choice` (the user's chosen goal), so resampled_portfolios.xlsx
+    holds just that one sheet -- the other goals stay as their single-shot weights in
+    optimised_portfolios.xlsx (Layer 5 reads them from there). If the choice is not yet
+    known, falls back to resampling all three. Each goal's averaged weights are
+    independent of which other goals run (per-goal SeedSequence(base_seed)), so the
+    chosen goal's result is byte-identical to resampling all three.
+
+    Drives resampling_wrapper's public functions in-process; the module is untouched.
     """
     module_header("Layer 7", "Resampling (Michaud, B=500) -> resampled_portfolios.xlsx")
     try:
@@ -373,10 +379,22 @@ def run_layer7(base_seed):
     else:
         print(f"  Base seed (from simulated_returns.npz): {base_seed}")
 
+    # Resolve the chosen goal (sheet name -> goal key). Fall back to all goals.
+    sheet_to_goal = {v: k for k, v in rw.GOAL_SHEET.items()}
+    goal = sheet_to_goal.get(portfolio_choice)
+    if goal is not None:
+        goals = [goal]
+        print(f"  Chosen goal: '{portfolio_choice}' -> resampling ONLY '{goal}' "
+              f"(others stay single-shot in optimised_portfolios.xlsx).")
+    else:
+        goals = list(rw.GOALS)
+        print(f"  No (recognised) portfolio_choice yet -- resampling all three goals "
+              f"as a fallback.")
+
     try:
         tickers, capm_mu = rw._load_universe()
         results = [rw.resample_goal(g, B=rw.DEFAULT_B, base_seed=base_seed)
-                   for g in rw.GOALS]
+                   for g in goals]
         rw.write_resampled_xlsx(results, capm_mu, tickers)
         rw.save_per_iter(results, tickers)
         _ok("Layer 7")
@@ -454,20 +472,33 @@ def run_layer5(inputs, base_seed):
         return False
 
     resampled_path = os.path.join(SCRIPT_DIR, "resampled_portfolios.xlsx")
+    optimised_path = os.path.join(SCRIPT_DIR, "optimised_portfolios.xlsx")
     if not os.path.exists(resampled_path):
         _fail("Layer 5", "resampled_portfolios.xlsx not found -- Layer 7 must run first")
         return False
 
+    # Layer 7 now resamples ONLY the chosen goal, so source each goal from where it
+    # actually lives: the chosen goal from resampled_portfolios.xlsx, the other two
+    # from optimised_portfolios.xlsx (single-shot). Decided per sheet by presence in
+    # the resampled file -- robust whether it holds one sheet or all three.
+    try:
+        resampled_sheets = set(pd.ExcelFile(resampled_path).sheet_names)
+    except Exception as exc:
+        _warn(f"Layer 5: could not read resampled sheets ({exc}); assuming none.")
+        resampled_sheets = set()
+
     seed = base_seed if base_seed is not None else 0
     portfolios = {}
     for sheet in ("Minimum Variance", "Max Risk-Adjusted", "Tail-Risk CVaR"):
+        src = resampled_path if sheet in resampled_sheets else optimised_path
         try:
-            w = rev.load_weights_from_xlsx(sheet, tickers, path=resampled_path)
+            w = rev.load_weights_from_xlsx(sheet, tickers, path=src)
             portfolios[sheet] = rev.evaluate_risk(
                 returns, w, tickers, random_seed=seed, label=sheet
             )
         except Exception as exc:
-            _warn(f"Layer 5: could not evaluate '{sheet}' ({exc})")
+            _warn(f"Layer 5: could not evaluate '{sheet}' from "
+                  f"{os.path.basename(src)} ({exc})")
 
     w_cur = _current_weights(inputs, tickers)
     if w_cur is not None:
@@ -482,7 +513,8 @@ def run_layer5(inputs, base_seed):
         "scenarios_seed":  base_seed,
         "n_scenarios":     int(returns.shape[0]),
         "tickers":         list(tickers),
-        "weights_source":  "resampled_portfolios.xlsx (canonical)",
+        "weights_source":  ("chosen goal: resampled_portfolios.xlsx; other goals: "
+                            "optimised_portfolios.xlsx (single-shot)"),
         "portfolios":      portfolios,        # keyed by portfolio name
     }
     try:
@@ -968,11 +1000,12 @@ def main():
         _fail("Pipeline", "Module 2 failed -- cannot continue")
         return
 
-    # ── LAYER 7 -- Resampling (CANONICAL weights) ─────────────────────────────
+    # ── LAYER 7 -- Resampling (chosen goal -> CANONICAL weights) ──────────────
     #   Reuses the simulation's recorded seed so the whole stochastic pipeline is
-    #   reproducible from one seed. Adds ~3-4 min (B=500 x three goals).
+    #   reproducible from one seed. Resamples ONLY the chosen goal (B=500), so this
+    #   is ~1/3 the cost when the choice is known up front.
     base_seed = simulation_seed()
-    if not run_layer7(base_seed):
+    if not run_layer7(base_seed, inputs.get("portfolio_choice")):
         _fail("Pipeline", "Layer 7 resampling failed -- cannot produce canonical weights")
         return
 
@@ -1025,13 +1058,15 @@ def main():
         "Robustness checks (momentum / correlation / sector) -> robustness_warnings.json",
     )
 
-    # ── MODULE 5 -- HTML report (optional) ────────────────────────────────────
+    # ── MODULE 5 -- Markdown report (optional) ────────────────────────────────
+    #   Reads run_config.json (portfolio_choice / holdings / currency, persisted
+    #   before Layer 6) plus the upstream artifacts; emits portfolio_report_*.md.
     result5 = run_subprocess(
-        "Module 5", "module5_report.py", "HTML portfolio report"
+        "Module 5", "module5_report.py", "Plain-language Markdown portfolio report"
     )
     if result5 is None:
         print(
-            "  [NOTE] module5_report.py was not found -- HTML report skipped."
+            "  [NOTE] module5_report.py was not found -- report skipped."
         )
         print(
             "         Build module5_report.py to enable this step."

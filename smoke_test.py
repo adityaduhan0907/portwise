@@ -199,13 +199,11 @@ def main():
         ("3  Module 3 (frontier)",    "[OK] Module 3 complete"),
         ("4  Module 4 (rebalancing)", "[OK] Module 4"),
         ("6  Layer 6 (robustness)",   "[OK] Layer 6 complete"),
+        ("5  Module 5 (report)",      "[OK] Module 5 complete"),
     ]
     print("  PER-STEP RESULT")
     for label, marker in steps:
         print(f"    [{'PASS' if marker in log else 'FAIL'}] {label}")
-    m5_absent = "module5_report.py was not found" in log or "module5_report.py not found" in log
-    print(f"    [{'SKIP' if m5_absent else '????'}] 5  Module 5 (report) -- absent; "
-          f"run_all skips GRACEFULLY (no error)")
 
     # Seed reported by Layer 7
     import re
@@ -267,6 +265,33 @@ def main():
               f"eff. sectors: {sc.get('effective_sectors', float('nan')):.2f}")
     else:
         print("    [FAIL] robustness_warnings.json not found")
+
+    # 3c. Module 5 report --------------------------------------------------------
+    print("\n  MODULE 5 OUTPUT (portfolio_report_*.md)")
+    reports = glob.glob(os.path.join(SCRIPT_DIR, "portfolio_report_*.md"))
+    ran_not_skipped = ("[OK] Module 5 complete" in log) and \
+                      ("module5_report.py was not found" not in log)
+    print(f"    step ran (not skipped): {ran_not_skipped}")
+    if reports:
+        rep_path = max(reports, key=os.path.getmtime)
+        text = open(rep_path, encoding="utf-8").read()
+        print(f"    report file: {os.path.basename(rep_path)}  ({len(text)} chars)")
+        # All seven sections present (title, 2..6 headings, footer disclaimer).
+        checks = [
+            ("1 Title + date",        text.startswith("# Your Portfolio Report")
+                                      and "**Date:**" in text),
+            ("2 Recommended",         "## 2. Your recommended portfolio" in text),
+            ("3 What to change",      "## 3. What to change" in text),
+            ("4 Risk picture",        "## 4. The risk picture" in text),
+            ("5 Things to be aware",  "## 5. Things to be aware of" in text),
+            ("6 Other options",       "## 6. The other options" in text),
+            ("7 Footer",              "not financial advice" in text),
+        ]
+        for name, ok in checks:
+            print(f"      [{'PASS' if ok else 'FAIL'}] section {name}")
+        print(f"    all seven sections present: {all(ok for _, ok in checks)}")
+    else:
+        print("    [FAIL] no portfolio_report_*.md produced")
 
     # 4. Canonical-weights check -------------------------------------------------
     print(f"\n  CANONICAL-WEIGHTS CHECK  (chosen goal: '{CHOSEN_GOAL}')")
@@ -335,7 +360,7 @@ def main():
     print("\n  DOWNSTREAM INPUTS")
     print("    Module 4 reads : resampled_portfolios.xlsx (CANONICAL; single-shot fallback)")
     print("    Module 3 reads : returns_stats.xlsx (Annualised Mu/Cov; sim-independent)")
-    print("    Module 5       : absent -> skipped gracefully")
+    print("    Module 5 reads : resampled weights + plan + risk + robustness -> portfolio_report_*.md")
 
     print(f"\n  RUNTIME")
     print(f"    pipeline wall-clock (run_all.main): {pipe_elapsed:6.1f}s  "

@@ -237,6 +237,8 @@ risk_evaluation_summary.json
 rebalancing_plan_*.xlsx
 robustness_warnings.json
 sectors.json
+portfolio_report_*.md
+prices_cache.pkl
 
 # Harness / test artifacts
 smoke_test_run.log
