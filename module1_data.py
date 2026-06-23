@@ -54,6 +54,14 @@ PRICES_CACHE_PATH = os.path.join(SCRIPT_DIR, "prices_cache.pkl")
 # ── Factor-model data source ────────────────────────────────────────────────────
 DATA_POINTS_PATH = os.path.join(SCRIPT_DIR, "data_points.xlsx")
 
+# ── Indian listing reference (user-maintained sector / market cap / P/B) ─────────
+#   For .NS/.BO tickers these three bucketing inputs are read from this file
+#   instead of a live Ticker().info call, removing the rate-limit-prone .info
+#   request from the user-facing run for listed Indian stocks. Market caps in
+#   column F are raw INR (same unit as INDIA_SIZE_SPLIT) -- no conversion needed.
+COMPANY_LIST_PATH  = os.path.join(SCRIPT_DIR, "company_list.xlsx")
+INDIA_LISTING_SHEET = "India Companies"   # 3rd sheet; cols A=Ticker C=Sector F=MktCap G=P/B
+
 # ── Sector handoff (here -> robustness_checks Layer-6 concentration check) ───────
 SECTORS_PATH     = os.path.join(SCRIPT_DIR, "sectors.json")  # {ticker: sector}
 
@@ -344,6 +352,83 @@ def _factor_expected_return(is_india, market_cap, pb, model):
     }
 
 
+_INDIA_LISTING = None   # lazy cache: {TICKER_UPPER: (sector, market_cap, pb)}
+
+
+def _load_india_listing(path=COMPANY_LIST_PATH, sheet=INDIA_LISTING_SHEET):
+    """
+    Build the offline Indian reference lookup {TICKER_UPPER: (sector, mcap, pb)}
+    from company_list.xlsx (cols A=Ticker, C=Sector, F=Market Cap, G=P/B).
+    Keyed by uppercase ticker INCLUDING its .NS/.BO suffix, matching the resolved
+    symbols module 1 carries. Market caps are raw INR (same unit as the size split).
+    Blank cells become None. Returns {} if the file/sheet is missing or unreadable
+    (callers then fall back to the live .info path).
+    """
+    global _INDIA_LISTING
+    if _INDIA_LISTING is not None:
+        return _INDIA_LISTING
+    listing = {}
+    try:
+        import openpyxl
+        wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
+        if sheet not in wb.sheetnames:
+            print(f"  WARNING: '{sheet}' sheet not in {os.path.basename(path)} -- "
+                  "Indian stocks will use live .info.")
+            wb.close()
+            _INDIA_LISTING = {}
+            return _INDIA_LISTING
+        ws = wb[sheet]
+        for row in ws.iter_rows(min_row=2, values_only=True):
+            # columns: A=0 Ticker, C=2 Sector, F=5 Market Cap, G=6 P/B
+            if not row or row[0] in (None, ""):
+                continue
+            ticker = str(row[0]).strip().upper()
+            sector = row[2] if len(row) > 2 else None
+            if isinstance(sector, str):
+                sector = sector.strip() or None
+            mcap = _to_float(row[5]) if len(row) > 5 else None
+            pb   = _to_float(row[6]) if len(row) > 6 else None
+            listing[ticker] = (sector, mcap, pb)
+        wb.close()
+    except FileNotFoundError:
+        print(f"  WARNING: {os.path.basename(path)} not found -- "
+              "Indian stocks will use live .info.")
+    except Exception as exc:
+        print(f"  WARNING: could not read Indian listing ({exc}); "
+              "Indian stocks will use live .info.")
+    _INDIA_LISTING = listing
+    return _INDIA_LISTING
+
+
+def _india_cap_pb_sector(ticker):
+    """
+    Resolve (market_cap, pb, sector, source) for an Indian (.NS/.BO) ticker WITHOUT
+    a live .info call when the ticker is in company_list.xlsx.
+
+      * Found in the list -> use its sector / market cap / P/B (blank P/B -> None,
+        which feeds module 1's existing neutral-P/B fallback). NO network call.
+      * Not in the list   -> fall back to the live .info path (_fetch_cap_pb) with
+        its retry/soft handling. If THAT throttles to a hard failure, degrade to
+        neutral bucket + "Unknown" sector (None, None, None) so one stock's .info
+        problem never aborts the whole run.
+
+    Returns (market_cap_or_None, pb_or_None, sector_or_None, source_str).
+    """
+    listing = _load_india_listing()
+    hit = listing.get(ticker.upper())
+    if hit is not None:
+        sector, mcap, pb = hit
+        return mcap, pb, sector, "company_list.xlsx"
+    # Not listed -> live .info, but never hard-stop the run on its failure.
+    try:
+        mcap, pb, sector = _fetch_cap_pb(ticker)
+        return mcap, pb, sector, "live .info (not in list)"
+    except TransientFetchError as exc:
+        print(f"    WARNING: {ticker} not in list and live .info failed "
+              f"({exc.detail}); using neutral bucket + Unknown sector.")
+        return None, None, None, "live .info FAILED -> neutral/Unknown"
+
+
 def _fetch_cap_pb(ticker):
     """
     Fetch (marketCap, priceToBook, sector) from yfinance ticker.info.
@@ -396,7 +481,13 @@ def calculate_capm_returns(tickers, rf_usa):
     results = {}
     for ticker in tickers:
         is_india = ticker.upper().endswith((".NS", ".BO"))
-        market_cap, pb, sector = _fetch_cap_pb(ticker)
+        if is_india:
+            # Offline: sector / market cap / P/B from company_list.xlsx (no .info).
+            market_cap, pb, sector, src = _india_cap_pb_sector(ticker)
+        else:
+            # US path unchanged: live .info (see report re: optionally softening).
+            market_cap, pb, sector = _fetch_cap_pb(ticker)
+            src = "live .info"
         comp = _factor_expected_return(is_india, market_cap, pb, model)
         results[ticker] = {
             "beta":            comp["beta_mkt"],
@@ -408,6 +499,7 @@ def calculate_capm_returns(tickers, rf_usa):
             "bucket":          comp["bucket"],
             "betas_by_factor": comp["betas_by_factor"],
             "sector":          sector if sector else "Unknown",
+            "cap_pb_source":   src,
         }
     return results
 
@@ -992,7 +1084,8 @@ def main():
     for s, v in capm_results.items():
         print(f"    {s:<22}  [{v['market']:5}]  beta={v['beta']:.3f}  "
               f"Rf={v['rf']*100:.2f}%  ERP={v['erp']*100:.2f}%  "
-              f"E[r]={v['expected_return']*100:>7.2f}%")
+              f"E[r]={v['expected_return']*100:>7.2f}%  "
+              f"({v.get('cap_pb_source', '')})")
 
     # Persist ticker -> sector for the Layer-6 robustness concentration check.
     # Captured from the same ticker.info fetch above (marketCap / priceToBook);
