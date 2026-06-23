@@ -53,17 +53,49 @@ def load_scenarios(source=SIM_PATH):
 
 def _empirical_cvar_loss(port, alpha=ALPHA):
     """Empirical CVaR(alpha) of a return vector, returned as a positive loss
-    (mean of the worst (1-alpha) tail). Matches Layer 5's definition."""
-    q = np.percentile(port, (1.0 - alpha) * 100.0)
-    tail = port[port <= q]
-    cvar_return = float(tail.mean()) if tail.size else float(q)
+    (mean of the worst (1-alpha) tail) plus the signed tail return.
+
+    Uses the MEAN OF THE WORST k = round((1-alpha)*S) outcomes rather than
+    mean(port[port <= percentile]). The two agree for a continuous distribution,
+    but Method-A scenarios are bootstrapped from a small pool of real months, so
+    `port` carries MANY exactly-tied values. The percentile-mask form is then
+    unstable at the boundary: a 1-ULP change in the cutoff (e.g. from a 1e-17
+    weight perturbation) flips a whole block of tied scenarios in/out of the tail,
+    swinging the reported CVaR by ~1pp for an UNCHANGED portfolio. The worst-k
+    form is tie-robust and monotonic, so the achieved-CVaR readout and the
+    cross-goal ordering are stable. The LP objective (Rockafellar-Uryasev) is
+    unchanged -- this only affects the post-hoc measurement."""
+    S = port.shape[0]
+    k = max(1, int(round((1.0 - alpha) * S)))
+    worst = np.partition(port, k - 1)[:k]       # k smallest returns (unordered)
+    cvar_return = float(worst.mean())
     return -cvar_return, cvar_return            # (positive loss, signed return)
 
 
 # ── Core CVaR optimisation (Rockafellar-Uryasev LP) ─────────────────────────────
 
+def _capped_max_return(mu_sim_m, w_min, w_max):
+    """
+    Highest achievable ANNUALISED mean under the adaptive box constraints
+    (w_min <= w_i <= w_max, sum=1). Water-fill: seed every asset at w_min, then
+    pour the remaining budget into the highest-mean assets up to w_max. Used so
+    the return-floor feasibility check is honest about the cap (you can no longer
+    put 100% in the single best asset).
+    """
+    n = mu_sim_m.shape[0]
+    w = np.full(n, w_min, dtype=float)
+    leftover = 1.0 - n * w_min
+    for i in np.argsort(mu_sim_m)[::-1]:               # highest mean first
+        if leftover <= 1e-12:
+            break
+        add = min(w_max - w_min, leftover)
+        w[i] += add
+        leftover -= add
+    return float(TRADING_MONTHS * (mu_sim_m @ w))
+
+
 def solve_min_cvar(scenarios, tickers=None, r_min=0.0, max_loss_target=None,
-                   alpha=ALPHA):
+                   alpha=ALPHA, apply_caps=True):
     """
     Minimise portfolio CVaR(alpha) over the scenario matrix.
 
@@ -71,10 +103,15 @@ def solve_min_cvar(scenarios, tickers=None, r_min=0.0, max_loss_target=None,
     r_min           : ANNUALISED minimum-return floor on the simulated mean.
     max_loss_target : optional MONTHLY max-loss target L (positive fraction, e.g.
                       0.05). Compared to the achieved CVaR; not a hard constraint.
+    apply_caps      : when True (default) apply the SAME adaptive per-asset box
+                      (3 stocks 5%-60% / 4-6 3%-35% / 7-15 2%-20%) that Max
+                      Risk-Adjusted uses, so the CVaR LP can't pile into one name.
+                      The schedule is reused from module2_optimiser.get_adaptive_bounds
+                      (NOT duplicated). Set False for the old uncapped behaviour.
 
     Returns a result dict (status / weights / achieved CVaR / expected return /
-    message). Never returns garbage weights: an infeasible floor yields status
-    'infeasible_return' with weights=None.
+    message / caps). Never returns garbage weights: an infeasible floor yields
+    status 'infeasible_return' with weights=None.
     """
     if isinstance(scenarios, pd.DataFrame):
         R, tickers = scenarios.values.astype(float), list(scenarios.columns)
@@ -85,7 +122,20 @@ def solve_min_cvar(scenarios, tickers=None, r_min=0.0, max_loss_target=None,
 
     S, n = R.shape
     mu_sim_m = R.mean(axis=0)                          # per-asset monthly mean
-    r_max_annual = float(TRADING_MONTHS * mu_sim_m.max())   # best single asset
+
+    # ── Adaptive per-asset box (reused from Max Risk-Adjusted) ────────────────
+    # Lazy import: module2_optimiser imports THIS module at its top, so importing
+    # it at module scope would be a circular import. Importing here is safe (the
+    # module is fully initialised by the time any solve runs).
+    if apply_caps:
+        from module2_optimiser import get_adaptive_bounds
+        w_min, w_max = get_adaptive_bounds(n)
+    else:
+        w_min, w_max = 0.0, 1.0
+
+    # r_max respects the cap: best single asset if uncapped, else cap water-fill.
+    r_max_annual = (_capped_max_return(mu_sim_m, w_min, w_max) if apply_caps
+                    else float(TRADING_MONTHS * mu_sim_m.max()))
 
     base = {
         "status":          None,
@@ -96,6 +146,8 @@ def solve_min_cvar(scenarios, tickers=None, r_min=0.0, max_loss_target=None,
         "r_min":           r_min,
         "r_max_annual":    r_max_annual,
         "max_loss_target": max_loss_target,
+        "caps":            {"applied": bool(apply_caps),
+                            "w_min": w_min, "w_max": w_max, "n_assets": n},
         "achieved_cvar_monthly_loss": None,
         "achieved_cvar_monthly_return": None,
         "expected_return_annual":  None,
@@ -105,11 +157,13 @@ def solve_min_cvar(scenarios, tickers=None, r_min=0.0, max_loss_target=None,
 
     # ── Feasibility check 1: is the return floor achievable at all? ────────────
     if r_min > r_max_annual + 1e-9:
+        cap_note = (f" (under the {w_max*100:.0f}% per-asset cap)" if apply_caps else "")
         base["status"]  = "infeasible_return"
         base["message"] = (
             f"INFEASIBLE: the highest achievable annualised return with these "
-            f"assets is ~{r_max_annual*100:.1f}%; your floor of {r_min*100:.1f}% "
-            f"can't be met. Lower the return floor to <= ~{r_max_annual*100:.1f}%."
+            f"assets{cap_note} is ~{r_max_annual*100:.1f}%; your floor of "
+            f"{r_min*100:.1f}% can't be met. Lower the return floor to "
+            f"<= ~{r_max_annual*100:.1f}%."
         )
         return base
 
@@ -140,7 +194,8 @@ def solve_min_cvar(scenarios, tickers=None, r_min=0.0, max_loss_target=None,
     )
     b_eq = np.array([1.0])
 
-    bounds = [(0.0, 1.0)] * n + [(None, None)] + [(0.0, None)] * S
+    # Per-asset box on w (adaptive caps + matching minimums); eta free; u_s >= 0.
+    bounds = [(w_min, w_max)] * n + [(None, None)] + [(0.0, None)] * S
 
     res = linprog(c, A_ub=A_ub, b_ub=b_ub, A_eq=A_eq, b_eq=b_eq,
                   bounds=bounds, method="highs")
@@ -169,8 +224,10 @@ def solve_min_cvar(scenarios, tickers=None, r_min=0.0, max_loss_target=None,
 
     floor_note = (f" Return floor {r_min*100:.1f}% satisfied "
                   f"({mean_m*TRADING_MONTHS*100:.1f}% achieved)." if r_min > 0 else "")
+    cap_note = (f" Per-asset caps applied (n={n}): {w_min*100:.0f}%-{w_max*100:.0f}%."
+                if apply_caps else " No per-asset caps (uncapped).")
     msg = (f"Minimised CVaR(95%) = {cvar_loss*100:.2f}% monthly worst-case loss."
-           + floor_note)
+           + floor_note + cap_note)
 
     # ── Feasibility check 3: max-loss target (comparison, not a constraint) ────
     if max_loss_target is not None and cvar_loss > max_loss_target + 1e-9:

@@ -3,8 +3,9 @@
 resampling_wrapper.py  —  Layer 7 (Michaud-style Resampling Wrapper)
 
 Stabilises and de-concentrates the optimizer weights by bootstrapping the inputs,
-re-optimizing B times, and AVERAGING the resulting weight vectors. B = 500 default
-(parameter, but 500 is the chosen value -- do not raise it).
+re-optimizing B times, and AVERAGING the resulting weight vectors. B defaults PER
+GOAL (parameter, do not raise): GMV / Max-Risk-Adjusted = 500, Tail-Risk CVaR = 250
+(the CVaR LP is the costlier per-iteration solve and 250 is stable enough).
 
 Reuses existing code -- nothing is re-implemented:
   - module1_data._ledoit_wolf_cov           (Method A covariance estimator)
@@ -57,9 +58,16 @@ SIM_PATH            = os.path.join(SCRIPT_DIR, "simulated_returns.npz")
 FACTOR_HISTORY_PATH = os.path.join(SCRIPT_DIR, "factor_history.json")
 WEIGHTS_NPZ_PATH    = os.path.join(SCRIPT_DIR, "resampled_weights.npz")
 
-DEFAULT_B    = 500          # chosen value -- do not raise
+DEFAULT_B      = 500        # chosen value for GMV / RAR -- do not raise
+DEFAULT_B_CVAR = 250        # CVaR goal only: the LP per-iter cost is higher and
+                            # 250 is stable enough (~halves the CVaR wall-clock)
 DEFAULT_SEED = 20260616
 GOALS        = ("gmv", "rar", "cvar")
+
+
+def default_B(goal):
+    """Per-goal resampling count: CVaR uses 250, GMV/RAR use 500."""
+    return DEFAULT_B_CVAR if goal == "cvar" else DEFAULT_B
 GOAL_SHEET   = {"gmv": "Minimum Variance", "rar": "Max Risk-Adjusted", "cvar": "Tail-Risk CVaR"}
 GOAL_LABEL   = {"gmv": "Min Variance (GMV)", "rar": "Max Risk-Adjusted", "cvar": "Tail-Risk CVaR"}
 
@@ -157,14 +165,19 @@ def _resample_cvar_goal(scen, tickers, r_min, B, base_seed):
 
 # ── Public entry point ──────────────────────────────────────────────────────────
 
-def resample_goal(goal, B=DEFAULT_B, base_seed=DEFAULT_SEED, r_min=0.0, verbose=True):
+def resample_goal(goal, B=None, base_seed=DEFAULT_SEED, r_min=0.0, verbose=True):
     """
     Run resampling for one goal ('gmv' / 'rar' / 'cvar'). Returns a result dict:
       {goal, status, tickers, avg_weights(dict), avg_array, per_iter (B x n),
        n_failures, elapsed_s, deferred(bool), message}
+
+    B is a parameter; when left as None it defaults PER GOAL via default_B()
+    (CVaR -> 250, GMV/RAR -> 500). Passing B explicitly overrides the default.
     """
     if goal not in GOALS:
         raise ValueError(f"goal must be one of {GOALS}, got {goal!r}")
+    if B is None:
+        B = default_B(goal)
 
     tickers, capm_mu = _load_universe()
     n = len(tickers)
@@ -243,12 +256,14 @@ def save_per_iter(results, tickers, path=WEIGHTS_NPZ_PATH):
 
 # ── Verification ────────────────────────────────────────────────────────────────
 
-def _verify(B=DEFAULT_B, seed_a=DEFAULT_SEED, seed_b=DEFAULT_SEED + 1, r_min=0.0):
+def _verify(B=None, seed_a=DEFAULT_SEED, seed_b=DEFAULT_SEED + 1, r_min=0.0):
     W = 74
     tickers, capm_mu = _load_universe()
+    b_desc = (f"B={B}" if B is not None
+              else f"B per goal (GMV/RAR={DEFAULT_B}, CVaR={DEFAULT_B_CVAR})")
     print(f"\n{'='*W}")
     print("  Layer 7 -- Resampling Wrapper  (VERIFICATION)")
-    print(f"  Assets : {', '.join(tickers)}   |   B={B}   |   seeds={seed_a},{seed_b}")
+    print(f"  Assets : {', '.join(tickers)}   |   {b_desc}   |   seeds={seed_a},{seed_b}")
     print(f"  Method : {'B (factor cov) DEFERRED' if _use_factor_cov() else 'A (Ledoit-Wolf)'}"
           f" for GMV/RAR   |   CVaR over Layer-4 scenarios")
     print(f"{'='*W}")
@@ -264,7 +279,7 @@ def _verify(B=DEFAULT_B, seed_a=DEFAULT_SEED, seed_b=DEFAULT_SEED + 1, r_min=0.0
         print(f"      {GOAL_LABEL[g]:<20}: byte-identical re-run = {identical}")
 
     # 2. Stability (is 500 enough): two seeds ------------------------------------
-    print(f"\n  [2] STABILITY  -- B={B}, two base seeds, drift between averaged vectors")
+    print(f"\n  [2] STABILITY  -- {b_desc}, two base seeds, drift between averaged vectors")
     results_b = {g: resample_goal(g, B=B, base_seed=seed_b, r_min=r_min, verbose=False)
                  for g in GOALS}
     for g in GOALS:
@@ -312,7 +327,7 @@ def _verify(B=DEFAULT_B, seed_a=DEFAULT_SEED, seed_b=DEFAULT_SEED + 1, r_min=0.0
           f"(CVaR <= RAR: {cvar_resampled <= cvar_rar + 1e-9})")
 
     # 6. Runtime -----------------------------------------------------------------
-    print(f"\n  [6] RUNTIME (per goal, B={B})")
+    print(f"\n  [6] RUNTIME ({b_desc})")
     for g in GOALS:
         print(f"      {GOAL_LABEL[g]:<20}: {by_goal_a[g]['elapsed_s']:6.1f}s"
               f"   ({by_goal_a[g]['n_failures']} failed solves)")

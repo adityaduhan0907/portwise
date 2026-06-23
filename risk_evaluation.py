@@ -99,13 +99,20 @@ def load_weights_from_xlsx(sheet_name, tickers, path=OPTIMISED_PATH):
 
 # ── Metrics ─────────────────────────────────────────────────────────────────────
 
-def _max_drawdown_paths(pool, n_paths, horizon, rng):
+def _sample_paths(pool, n_paths, horizon, rng):
     """
-    String independent monthly draws from `pool` into n_paths sequences of length
-    `horizon`, compound each into a wealth curve, and return (median, p95) of the
-    per-path max peak-to-trough drawdown (positive fractions, e.g. 0.25 = -25%).
+    String independent monthly draws from `pool` into an (n_paths, horizon) matrix
+    of monthly returns. Shared helper for the drawdown metric and the annual
+    VaR/CVaR distribution so both use the SAME path construction.
     """
-    draws = pool[rng.integers(0, pool.shape[0], size=(n_paths, horizon))]
+    return pool[rng.integers(0, pool.shape[0], size=(n_paths, horizon))]
+
+
+def _max_drawdown_from_paths(draws):
+    """
+    (median, p95) of per-path max peak-to-trough drawdown for a matrix of monthly
+    returns (positive fractions, e.g. 0.25 = -25%).
+    """
     wealth = np.cumprod(1.0 + draws, axis=1)            # (n_paths, horizon)
     running_peak = np.maximum.accumulate(wealth, axis=1)
     drawdowns = wealth / running_peak - 1.0             # <= 0
@@ -113,6 +120,22 @@ def _max_drawdown_paths(pool, n_paths, horizon, rng):
     median_dd = float(np.median(worst_per_path))
     p95_dd    = float(np.percentile(worst_per_path, 95))
     return median_dd, p95_dd
+
+
+def _annual_var_cvar_from_paths(draws, alpha=0.95):
+    """
+    Annual VaR / CVaR from a matrix of monthly returns. Compound each path's
+    `horizon` monthly returns into ONE annual return, then read off the
+    (1-alpha) tail of that annual distribution:
+        VaR(alpha)  = (1-alpha)*100-th percentile annual return (a loss)
+        CVaR(alpha) = mean of the annual returns at/below that percentile
+    Returns (var_return, cvar_return) as SIGNED annual returns (losses are < 0).
+    """
+    annual = np.prod(1.0 + draws, axis=1) - 1.0         # (n_paths,) annual returns
+    var_q  = float(np.percentile(annual, (1.0 - alpha) * 100.0))
+    tail   = annual[annual <= var_q]
+    cvar_q = float(tail.mean()) if tail.size else var_q
+    return var_q, cvar_q
 
 
 def evaluate_risk(scenarios, weights, tickers=None, *,
@@ -149,8 +172,14 @@ def evaluate_risk(scenarios, weights, tickers=None, *,
 
     p_large = float(np.mean(port < large_loss_threshold))
 
-    rng = np.random.default_rng(random_seed)
-    dd_median, dd_p95 = _max_drawdown_paths(port, dd_paths, dd_horizon, rng)
+    # Build the path matrix ONCE (same construction the drawdown metric uses):
+    # n_paths sequences of `dd_horizon` independent monthly draws. The annual
+    # VaR/CVaR compounds each path into an annual return; drawdown reads the
+    # intra-path peak-to-trough off the same matrix.
+    rng   = np.random.default_rng(random_seed)
+    draws = _sample_paths(port, dd_paths, dd_horizon, rng)
+    dd_median, dd_p95 = _max_drawdown_from_paths(draws)
+    var_a, cvar_a     = _annual_var_cvar_from_paths(draws, alpha=0.95)
 
     return {
         "label":            label,
@@ -166,15 +195,25 @@ def evaluate_risk(scenarios, weights, tickers=None, *,
             "annualized":        round(std_m * np.sqrt(TRADING_MONTHS), 6),
             "horizon":           "monthly std; annualised = std x sqrt(12)",
         },
+        # VaR/CVaR are now reported on the ANNUAL return distribution (12 monthly
+        # returns compounded across many paths), NOT monthly x 12. The monthly
+        # figures are retained for sanity-checking the conversion.
         "var_95": {
-            "monthly_return":    round(var_q, 6),        # signed (a loss, < mean)
-            "monthly_loss":      round(-var_q, 6),       # positive loss magnitude
-            "horizon":           "monthly; 5th-percentile outcome",
+            "annual_return":     round(var_a, 6),        # signed annual (a loss)
+            "annual_loss":       round(-var_a, 6),       # positive loss magnitude
+            "monthly_return":    round(var_q, 6),        # signed monthly (legacy)
+            "monthly_loss":      round(-var_q, 6),
+            "horizon":           ("annual; 5th-pct of compounded 12-month returns "
+                                  f"({dd_paths} paths). monthly_* = legacy 5th-pct "
+                                  "monthly outcome."),
         },
         "cvar_95": {
-            "monthly_return":    round(cvar_q, 6),       # signed (< VaR)
+            "annual_return":     round(cvar_a, 6),       # signed annual (< VaR)
+            "annual_loss":       round(-cvar_a, 6),
+            "monthly_return":    round(cvar_q, 6),       # signed monthly (legacy)
             "monthly_loss":      round(-cvar_q, 6),
-            "horizon":           "monthly; mean of outcomes <= 5th pct",
+            "horizon":           ("annual; mean of worst 5% compounded 12-month "
+                                  f"returns ({dd_paths} paths). monthly_* = legacy."),
         },
         "chance_large_loss": {
             "threshold":         large_loss_threshold,
@@ -205,10 +244,10 @@ def print_metrics(m):
           f"[{er['monthly_mean']*100:.2f}%/mo]")
     print(f"  Volatility      (annualised) : {vol['annualized']*100:>8.2f}%   "
           f"[{vol['monthly_std']*100:.2f}%/mo]")
-    print(f"  VaR  95% (monthly loss)      : {m['var_95']['monthly_loss']*100:>8.2f}%   "
-          f"(outcome {m['var_95']['monthly_return']*100:.2f}%)")
-    print(f"  CVaR 95% (monthly loss)      : {m['cvar_95']['monthly_loss']*100:>8.2f}%   "
-          f"(outcome {m['cvar_95']['monthly_return']*100:.2f}%)")
+    print(f"  VaR  95% (annual loss)       : {m['var_95']['annual_loss']*100:>8.2f}%   "
+          f"[monthly {m['var_95']['monthly_loss']*100:.2f}%]")
+    print(f"  CVaR 95% (annual loss)       : {m['cvar_95']['annual_loss']*100:>8.2f}%   "
+          f"[monthly {m['cvar_95']['monthly_loss']*100:.2f}%]")
     cl = m["chance_large_loss"]
     print(f"  P(loss worse than {cl['threshold']*100:.0f}%/mo)    : "
           f"{cl['probability']*100:>8.2f}%")

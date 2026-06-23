@@ -388,7 +388,8 @@ def run_layer7(base_seed, portfolio_choice=None):
 
     Drives resampling_wrapper's public functions in-process; the module is untouched.
     """
-    module_header("Layer 7", "Resampling (Michaud, B=500) -> resampled_portfolios.xlsx")
+    module_header("Layer 7", "Resampling (Michaud, B=500 GMV/RAR, B=250 CVaR) "
+                  "-> resampled_portfolios.xlsx")
     try:
         import resampling_wrapper as rw
     except Exception as exc:
@@ -416,8 +417,8 @@ def run_layer7(base_seed, portfolio_choice=None):
 
     try:
         tickers, capm_mu = rw._load_universe()
-        results = [rw.resample_goal(g, B=rw.DEFAULT_B, base_seed=base_seed)
-                   for g in goals]
+        # B left as default so it resolves PER GOAL (CVaR -> 250, GMV/RAR -> 500).
+        results = [rw.resample_goal(g, base_seed=base_seed) for g in goals]
         rw.write_resampled_xlsx(results, capm_mu, tickers)
         rw.save_per_iter(results, tickers)
         _ok("Layer 7")
@@ -548,6 +549,33 @@ def run_layer5(inputs, base_seed):
         return True
     except Exception as exc:
         _fail("Layer 5", f"could not write risk_evaluation_summary.json: {exc}")
+        return False
+
+
+# ── Historical crisis stress test (reuses stress_test; runs after Layer 5) ─────
+
+def run_stress_test_layer(inputs):
+    """
+    Replay the chosen (resampled) portfolio through the named historical crisis
+    windows and write stress_test.json. Reuses stress_test's public function;
+    coverage is reported honestly (missing stocks are never back-filled). Never
+    halts the pipeline -- Module 5 / the UI consume the JSON next pass.
+    """
+    module_header("Stress Test", "Historical crisis replay -> stress_test.json")
+    try:
+        import stress_test as st
+    except Exception as exc:
+        _warn(f"Stress test: cannot import stress_test ({exc}) -- skipped.")
+        return False
+    try:
+        # The chosen goal's weights live in resampled_portfolios.xlsx; the chosen
+        # sheet may not be picked yet (interactive choice comes after Module 3),
+        # in which case stress_test falls back to an available resampled goal.
+        st.run_stress_test(sheet=inputs.get("portfolio_choice"))
+        _ok("Stress Test")
+        return True
+    except Exception as exc:
+        _warn(f"Stress test failed ({exc}) -- continuing (non-blocking).")
         return False
 
 
@@ -894,6 +922,7 @@ def print_end_summary(inputs, rebalance_stats, today_str):
         "optimised_portfolios.xlsx",
         "resampled_portfolios.xlsx",
         "risk_evaluation_summary.json",
+        "stress_test.json",
         "efficient_frontier.png",
         f"rebalancing_plan_{date_stamp}.xlsx",
         "robustness_warnings.json",
@@ -1076,6 +1105,9 @@ def run_pipeline(tickers, holdings, currency, portfolio_choice,
     _progress(6, "Evaluating risk")
     if not run_layer5(inputs, base_seed):
         _warn("Layer 5 risk evaluation failed -- continuing (rebalancing unaffected).")
+
+    # ── STRESS TEST -- historical crisis replay (after Layer 5, non-blocking) ──
+    run_stress_test_layer(inputs)
 
     # ── MODULE 3 -- Efficient frontier ────────────────────────────────────────
     _progress(7, "Building frontier")
