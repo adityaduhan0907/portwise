@@ -31,9 +31,10 @@ from datetime import datetime
 
 import numpy as np
 import pandas as pd
-import yfinance as yf
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
+
+import fetch_util
 
 warnings.filterwarnings("ignore")
 
@@ -192,18 +193,15 @@ def fetch_usd_inr_rate():
     float  — number of INR per USD  (e.g. 95.95)
     """
     print("  Fetching live USD/INR rate (USDINR=X) ...", end=" ", flush=True)
-    for attempt in range(3):
-        try:
-            hist = yf.Ticker("USDINR=X").history(period="3d")
-            if not hist.empty:
-                rate = float(hist["Close"].iloc[-1])
-                print(f"{rate:.4f} INR/USD")
-                return rate
-        except Exception as exc:
-            if attempt < 2:
-                time.sleep(2)
-            else:
-                print(f"failed ({exc})")
+    try:
+        hist = fetch_util.fetch_history("USDINR=X", period="3d", what="USD/INR spot")
+        if hist is not None and not hist.empty:
+            rate = float(hist["Close"].iloc[-1])
+            print(f"{rate:.4f} INR/USD")
+            return rate
+    except fetch_util.TransientFetchError as exc:
+        # Auxiliary display-FX rate -> fall back to manual entry rather than abort.
+        print(f"failed ({exc.detail})")
 
     # Manual fallback if yfinance cannot retrieve the rate
     print("  Could not fetch the exchange rate automatically.")

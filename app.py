@@ -3,26 +3,15 @@ import json
 import math
 import os
 import sys
-import time
 import warnings
 from datetime import datetime
 
 import pandas as pd
 import streamlit as st
 
+import fetch_util
+
 warnings.filterwarnings("ignore")
-
-
-def fetch_with_retry(fetch_fn, max_retries=3, delay=2):
-    """Retry a zero-argument callable up to max_retries times."""
-    for attempt in range(max_retries):
-        try:
-            return fetch_fn()
-        except Exception as exc:
-            if attempt < max_retries - 1:
-                time.sleep(delay)
-            else:
-                raise exc
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 MAX_STOCKS = 15
@@ -105,9 +94,8 @@ for _k, _v in [
 
 def get_usd_inr():
     try:
-        import yfinance as yf
-        h = fetch_with_retry(lambda: yf.Ticker("USDINR=X").history(period="3d"))
-        if not h.empty:
+        h = fetch_util.fetch_history("USDINR=X", period="3d", what="USD/INR spot")
+        if h is not None and not h.empty:
             return float(h["Close"].iloc[-1])
     except Exception:
         pass
@@ -183,8 +171,7 @@ def load_robustness():
 def fetch_ticker_info(ticker):
     """Returns (company_name, country). Cached 1 hour."""
     try:
-        import yfinance as yf
-        info = fetch_with_retry(lambda: yf.Ticker(ticker).info)
+        info = fetch_util.fetch_info(ticker)
         name = info.get("longName") or info.get("shortName") or ticker
         country = info.get("country") or "N/A"
         return name, country
@@ -196,8 +183,7 @@ def fetch_ticker_info(ticker):
 def fetch_ticker_sector(ticker):
     """Returns sector string or None. Cached 1 hour."""
     try:
-        import yfinance as yf
-        info = fetch_with_retry(lambda: yf.Ticker(ticker).info)
+        info = fetch_util.fetch_info(ticker)
         return info.get("sector") or None
     except Exception:
         return None
@@ -207,8 +193,7 @@ def fetch_ticker_sector(ticker):
 def fetch_ticker_pe(ticker):
     """Returns forwardPE first, falls back to trailingPE, then None. Cached 1 hour."""
     try:
-        import yfinance as yf
-        info = fetch_with_retry(lambda: yf.Ticker(ticker).info)
+        info = fetch_util.fetch_info(ticker)
         pe = info.get("forwardPE")
         if pe is None or (isinstance(pe, float) and pe != pe):
             pe = info.get("trailingPE")
@@ -266,9 +251,8 @@ def fetch_benchmark_returns():
     out = {}
     for label, sym in [("S&P 500", "^GSPC"), ("Nifty 50", "^NSEI")]:
         try:
-            import yfinance as yf
-            hist = fetch_with_retry(lambda s=sym: yf.Ticker(s).history(period="2y"))
-            if hist.empty or len(hist) < 2:
+            hist = fetch_util.fetch_history(sym, period="2y", what=f"{label} benchmark")
+            if hist is None or hist.empty or len(hist) < 2:
                 out[label] = None
                 continue
             s = hist["Close"].dropna()
@@ -492,20 +476,28 @@ if st.button("Run Optimization", use_container_width=True,
         + [{"ticker": h["ticker"], "shares": 0.0} for h in _new_filled]
     )
 
+    # Clean progress UI: a "Running…" header, a bar, and one short stage label.
+    _head_box = st.empty()
+    _bar_box  = st.empty()
+    _cap_box  = st.empty()
+    _head_box.markdown("**Running…**")
+    _bar = _bar_box.progress(0)
+
+    def _on_progress(done, total, label):
+        pct = int(min(max(done / total, 0.0), 1.0) * 100)
+        _bar.progress(pct)
+        _cap_box.caption(label)
+
     try:
         import run_all
-        with st.spinner(
-            "Running the full analysis pipeline "
-            "(prices -> optimise -> resample -> risk -> robustness -> report)... "
-            "this takes about a minute."
-        ):
-            run_all.run_pipeline(
-                tickers=tickers,
-                holdings=all_holdings,
-                currency=selected_currency,
-                portfolio_choice=selected_target,
-                interactive=False,
-            )
+        run_all.run_pipeline(
+            tickers=tickers,
+            holdings=all_holdings,
+            currency=selected_currency,
+            portfolio_choice=selected_target,
+            interactive=False,
+            progress_callback=_on_progress,
+        )
         st.session_state.results = dict(
             target=selected_target,
             currency=selected_currency,
@@ -514,6 +506,11 @@ if st.button("Run Optimization", use_container_width=True,
     except Exception as exc:
         # PipelineError (or anything else) -> friendly message, never a stack trace.
         st.session_state.error = str(exc) or exc.__class__.__name__
+    finally:
+        # Clear the progress UI either way; results or the error render below.
+        _head_box.empty()
+        _bar_box.empty()
+        _cap_box.empty()
 
 if not _can_run:
     st.caption("Enter at least 3 tickers to run.")

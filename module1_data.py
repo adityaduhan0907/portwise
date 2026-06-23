@@ -26,13 +26,14 @@ import json
 import math
 import os
 import pickle
-import time
 import warnings
 from datetime import date, datetime
 
 import numpy as np
 import pandas as pd
-import yfinance as yf
+
+import fetch_util
+from fetch_util import TransientFetchError
 
 warnings.filterwarnings("ignore")
 
@@ -148,45 +149,25 @@ TICKERS = _load_tickers()
 
 # ── Download helpers ───────────────────────────────────────────────────────────
 
-def _fetch_close(symbol, start, end, interval="1d"):
+def resolve_and_fetch(raw_ticker, start, end, interval="1d", prefer=None):
     """
-    Download adjusted closing prices for one symbol at the given interval.
-    Returns a pd.Series (DatetimeIndex -> float) or None on any failure.
-    """
-    try:
-        raw = yf.download(
-            symbol, start=start, end=end,
-            interval=interval,
-            auto_adjust=True, progress=False, threads=False,
-        )
-        if raw.empty:
-            return None
-        close = raw["Close"]
-        if isinstance(close, pd.DataFrame):
-            close = close.iloc[:, 0]
-        close = close.dropna()
-        return close if not close.empty else None
-    except Exception:
-        return None
+    Hardened price fetch (retry + backoff + timeout) via fetch_util.
 
+    Tries the ticker as supplied; for a genuinely unsuffixed ticker it falls back
+    to .NS then .BO (a suffixed ticker is fetched AS-IS — never the bare US symbol).
+    ``prefer`` short-circuits resolution to a symbol already resolved elsewhere
+    (e.g. module 0's handoff), so bare symbols are not re-probed within a run.
 
-def resolve_and_fetch(raw_ticker, start, end, interval="1d"):
+    Returns (resolved_symbol, series, error_message); error_message is set only
+    for GENUINE missing data. A persistent TRANSIENT failure (throttle/timeout/
+    connection) RAISES TransientFetchError so it is never silently swallowed.
     """
-    Try the ticker as supplied; if no data and no dot suffix, retry with
-    .NS then .BO.  Returns (resolved_symbol, series, error_message).
-    """
-    candidates = (
-        [raw_ticker] if "." in raw_ticker
-        else [raw_ticker, f"{raw_ticker}.NS", f"{raw_ticker}.BO"]
+    symbol, series, err = fetch_util.resolve_and_fetch(
+        raw_ticker, start=start, end=end, interval=interval, prefer=prefer,
     )
-    for symbol in candidates:
-        series = _fetch_close(symbol, start, end, interval)
-        if series is not None:
-            if symbol != raw_ticker:
-                print(f"    Auto-resolved '{raw_ticker}' -> '{symbol}'")
-            return symbol, series, None
-    tried = ", ".join(candidates)
-    return None, None, f"No data returned (tried: {tried})"
+    if symbol is not None and symbol != raw_ticker and prefer is None:
+        print(f"    Auto-resolved '{raw_ticker}' -> '{symbol}'")
+    return symbol, series, err
 
 
 # ── Momentum return (12M-1M) ───────────────────────────────────────────────────
@@ -363,7 +344,7 @@ def _factor_expected_return(is_india, market_cap, pb, model):
     }
 
 
-def _fetch_cap_pb(ticker, max_retries=3, delay=1):
+def _fetch_cap_pb(ticker):
     """
     Fetch (marketCap, priceToBook, sector) from yfinance ticker.info.
     If priceToBook is missing, compute currentPrice / bookValue.
@@ -372,16 +353,10 @@ def _fetch_cap_pb(ticker, max_retries=3, delay=1):
     missing/blank sector is returned as None (callers map it to "Unknown").
     Returns (market_cap_or_None, pb_or_None, sector_or_None).
     """
-    info = {}
-    for attempt in range(max_retries):
-        try:
-            info = yf.Ticker(ticker).info or {}
-            if info:
-                break
-        except Exception:
-            info = {}
-        if attempt < max_retries - 1:
-            time.sleep(delay)
+    # Hardened + memoised .info (retry/backoff on throttle; raises
+    # TransientFetchError if the CALL itself keeps failing). A SPARSE dict that
+    # merely lacks fields is fine -- the field fallbacks below stay legitimate.
+    info = fetch_util.fetch_info(ticker)
 
     market_cap = _to_float(info.get("marketCap"))
 
@@ -516,20 +491,52 @@ def compute_asset_residuals(symbol, monthly_returns, market, betas_by_factor, fa
     return residual, n_asset_months
 
 
-def _monthly_returns_max_history(symbol, end):
+def _monthly_returns_from_prices(prices):
     """
-    Fetch the asset's monthly returns over max history (from RESIDUAL_START),
-    indexed by month Period. Returns an empty Series on failure.
+    Convert a monthly close Series into monthly returns indexed by month Period.
+    Returns an empty Series for missing/empty input. (Math unchanged; split out so
+    cached residual-history prices can feed it without a re-fetch.)
     """
-    _, prices, err = resolve_and_fetch(symbol, RESIDUAL_START, end, "1mo")
-    if err or prices is None or prices.empty:
+    if prices is None or len(prices) == 0:
         return pd.Series(dtype=float)
     rets = prices.sort_index().pct_change().dropna()
     if rets.empty:
         return pd.Series(dtype=float)
     rets.index = pd.PeriodIndex(rets.index, freq="M")
-    rets = rets[~rets.index.duplicated(keep="last")]
-    return rets
+    return rets[~rets.index.duplicated(keep="last")]
+
+
+def _monthly_returns_max_history(symbol, end, prefer=None):
+    """
+    Fetch the asset's monthly returns over max history (from RESIDUAL_START),
+    indexed by month Period. Returns an empty Series on GENUINE missing data; a
+    persistent transient fetch failure raises TransientFetchError (loud).
+    """
+    _, prices, err = resolve_and_fetch(symbol, RESIDUAL_START, end, "1mo", prefer=prefer)
+    if err or prices is None or prices.empty:
+        return pd.Series(dtype=float)
+    return _monthly_returns_from_prices(prices)
+
+
+def _load_resolved_map(path=FACTOR_HISTORY_PATH):
+    """
+    Read module 0's already-resolved symbols (asset_history[ticker]["resolved"])
+    from factor_history.json. Lets module 1 fetch the known listing directly via
+    ``prefer=`` instead of re-probing bare -> .NS -> .BO a SECOND time this run,
+    which both cuts request volume and keeps the two modules on the same listing.
+    Returns {REQUESTED_TICKER_UPPER: resolved_symbol}. Empty on any failure.
+    """
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        out = {}
+        for raw, info in (data.get("asset_history") or {}).items():
+            resolved = (info or {}).get("resolved")
+            if resolved:
+                out[raw.strip().upper()] = resolved
+        return out
+    except Exception:
+        return {}
 
 
 def _load_use_factor_flag(path=FACTOR_HISTORY_PATH, default=False):
@@ -757,9 +764,11 @@ def _cache_usable(cache, tickers):
 
 def _slice_cache(cache, tickers):
     """
-    Reconstruct (daily_prices, mom_prices, cov_prices, failed) limited to the
-    requested tickers from a usable cache. Keyed by resolved symbol, as the fetch
-    loop would have produced.
+    Reconstruct (daily_prices, mom_prices, cov_prices, resid_prices, failed)
+    limited to the requested tickers from a usable cache. Keyed by resolved symbol,
+    as the fetch loop would have produced. ``resid_prices`` is the max-history
+    monthly close series for the residual computation -- absent in pre-upgrade
+    caches, in which case it comes back all-None and main() re-fetches it once.
     """
     requested = [t.strip().upper() for t in tickers]
     t2s = cache.get("ticker_to_symbol", {})
@@ -768,11 +777,12 @@ def _slice_cache(cache, tickers):
     daily = {s: cache["daily_prices"][s] for s in symbols if s in cache["daily_prices"]}
     mom   = {s: cache["mom_prices"].get(s) for s in symbols}
     cov   = {s: cache["cov_prices"].get(s) for s in symbols}
+    resid = {s: cache.get("resid_prices", {}).get(s) for s in symbols}
     failed = {t: cache["failed"][t] for t in requested if t in cache.get("failed", {})}
-    return daily, mom, cov, failed
+    return daily, mom, cov, resid, failed
 
 
-def _save_price_cache(daily_prices, mom_prices, cov_prices, failed,
+def _save_price_cache(daily_prices, mom_prices, cov_prices, resid_prices, failed,
                       requested_tickers, ticker_to_symbol, path=PRICES_CACHE_PATH):
     """Persist the raw price dicts + timestamp + ticker set for later reuse."""
     payload = {
@@ -783,6 +793,7 @@ def _save_price_cache(daily_prices, mom_prices, cov_prices, failed,
         "daily_prices":      daily_prices,
         "mom_prices":        mom_prices,
         "cov_prices":        cov_prices,
+        "resid_prices":      resid_prices,
         "failed":            failed,
     }
     try:
@@ -825,22 +836,28 @@ def main():
     daily_prices  = {}   # symbol -> pd.Series (daily)
     mom_prices    = {}   # symbol -> pd.Series (monthly closes, momentum window)
     cov_prices    = {}   # symbol -> pd.Series (monthly closes, long-run)
+    resid_prices  = {}   # symbol -> pd.Series (monthly closes, max history; residuals)
     failed        = {}   # original ticker -> error message
+
+    # Symbols module 0 already resolved -> fetch that listing directly (no re-probe).
+    resolved_map = _load_resolved_map()
 
     cache = _load_price_cache()
     usable, reason = _cache_usable(cache, TICKERS)
     if usable:
         print(f"  Using cached prices (downloaded {reason} ago) -- skipping yfinance download.")
-        daily_prices, mom_prices, cov_prices, failed = _slice_cache(cache, TICKERS)
+        daily_prices, mom_prices, cov_prices, resid_prices, failed = _slice_cache(cache, TICKERS)
     else:
         print(f"  Downloading fresh prices...  (cache: {reason})")
         ticker_to_symbol = {}   # requested ticker -> resolved symbol
         for raw in TICKERS:
             ticker = raw.strip().upper()
             print(f"  [{ticker}]")
+            prefer = resolved_map.get(ticker)   # module 0's resolved listing, if any
 
             # Daily (3 years) -- determines the resolved symbol
-            symbol, daily_s, err = resolve_and_fetch(ticker, daily_start, today, "1d")
+            symbol, daily_s, err = resolve_and_fetch(ticker, daily_start, today, "1d",
+                                                     prefer=prefer)
             if err:
                 print(f"    SKIP: {err}")
                 failed[ticker] = err
@@ -856,7 +873,7 @@ def main():
             daily_prices[symbol] = daily_s
             print(f"    Daily      : {len(daily_s):>4} obs  OK")
 
-            # Momentum monthly (reuse resolved symbol)
+            # Momentum monthly (reuse resolved symbol -> single, suffixed candidate)
             _, mom_s, err_m = resolve_and_fetch(symbol, mom_start, today, "1mo")
             if err_m or mom_s is None:
                 print(f"    Momentum   : WARNING -- {err_m or 'no data'}")
@@ -884,9 +901,20 @@ def main():
                     print(f"    Long-run   : {len(cov_s):>4} monthly prices  OK")
                 cov_prices[symbol] = cov_s
 
+            # Residual max-history monthly (reuse resolved symbol) -- fetched here
+            # (instead of an uncached re-pull in section 6b) so a cached run is
+            # genuinely network-light. None on genuine missing; transient raises.
+            _, resid_s, err_r = resolve_and_fetch(symbol, RESIDUAL_START, today, "1mo")
+            if err_r or resid_s is None:
+                print(f"    Residual   : WARNING -- {err_r or 'no data'}; residuals will be empty")
+                resid_prices[symbol] = None
+            else:
+                print(f"    Residual   : {len(resid_s):>4} monthly prices  OK")
+                resid_prices[symbol] = resid_s
+
         # Persist the raw history so the next run within PRICES_MAX_AGE_HRS reuses it.
         if daily_prices:
-            _save_price_cache(daily_prices, mom_prices, cov_prices, failed,
+            _save_price_cache(daily_prices, mom_prices, cov_prices, resid_prices, failed,
                               TICKERS, ticker_to_symbol)
 
     if not daily_prices:
@@ -1014,7 +1042,13 @@ def main():
             continue
         market    = cr["market"]
         betas     = cr["betas_by_factor"]
-        m_rets    = _monthly_returns_max_history(s, today)
+        # Prefer the residual prices fetched/cached in section 1; only re-fetch if
+        # absent (genuine miss, or a pre-upgrade cache without resid_prices).
+        cached_resid = resid_prices.get(s)
+        if cached_resid is not None:
+            m_rets = _monthly_returns_from_prices(cached_resid)
+        else:
+            m_rets = _monthly_returns_max_history(s, today)
         residuals, n_hist = compute_asset_residuals(s, m_rets, market, betas, factor_hist)
         asset_residuals[s] = {
             "market":         market,
@@ -1182,4 +1216,12 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import sys
+    try:
+        main()
+    except TransientFetchError as exc:
+        # Loud, named transient failure -> hand the ticker/call to run_all (parent)
+        # and exit non-zero so the pipeline STOPS instead of producing degraded data.
+        fetch_util.write_fetch_error(exc.ticker, exc.what, exc.detail, module="module1")
+        print(f"\n  ERROR: {exc}\n")
+        sys.exit(1)

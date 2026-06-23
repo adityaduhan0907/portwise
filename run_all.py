@@ -49,6 +49,8 @@ from datetime import datetime
 
 import pandas as pd
 
+import fetch_util
+
 warnings.filterwarnings("ignore")
 
 # ── Constants ──────────────────────────────────────────────────────────────────
@@ -326,6 +328,18 @@ def run_subprocess(label, script_name, description=""):
     except Exception as exc:
         _fail(label, f"unexpected error: {exc}")
         return False
+
+
+def _data_fetch_message(fallback):
+    """
+    If a module subprocess died on a transient yfinance failure it leaves a
+    fetch_error.json marker naming the ticker + call. Promote that into the
+    PipelineError message so the app shows 'couldn't fetch TICKER — please retry'
+    instead of a generic 'Module N failed'. Returns `fallback` if no marker.
+    """
+    marker = fetch_util.read_fetch_error()
+    msg = fetch_util.friendly_message(marker)
+    return msg or fallback
 
 
 def simulation_is_fresh():
@@ -896,7 +910,8 @@ def print_end_summary(inputs, rebalance_stats, today_str):
 # ── Main pipeline ──────────────────────────────────────────────────────────────
 
 def run_pipeline(tickers, holdings, currency, portfolio_choice,
-                 benchmark="^GSPC", interactive=False, today_str=None):
+                 benchmark="^GSPC", interactive=False, today_str=None,
+                 progress_callback=None):
     """
     Programmatic entry point for the whole pipeline.
 
@@ -922,6 +937,13 @@ def run_pipeline(tickers, holdings, currency, portfolio_choice,
                                     False (default) runs fully unattended with safe
                                     defaults (keep flagged tickers; first goal if needed).
     today_str        : str | None  date stamp; defaults to today.
+    progress_callback: callable | None  optional UI hook. If given, it is called as
+                                    progress_callback(stage_ordinal, total_stages,
+                                    short_label) as EACH of the 10 stages begins -- e.g.
+                                    (3, 10, "Running simulation"). Default None is a
+                                    no-op, so the terminal flow is unchanged. The
+                                    callback is for UI only; it prints nothing and any
+                                    exception it raises is swallowed.
 
     Returns a summary dict on success. Raises PipelineError on any hard failure.
     """
@@ -936,17 +958,34 @@ def run_pipeline(tickers, holdings, currency, portfolio_choice,
         "portfolio_choice": portfolio_choice,
     }
 
+    # Real stage boundaries (in execution order) reported to an optional UI callback.
+    # No-op for the terminal flow (progress_callback is None); never prints.
+    TOTAL_STAGES = 10
+
+    def _progress(ordinal, label):
+        if progress_callback is not None:
+            try:
+                progress_callback(ordinal, TOTAL_STAGES, label)
+            except Exception:
+                pass
+
     rebalance_stats = None    # populated after module4 runs
 
     # ── Write run_config.json (modules 0 and 1 will read it) ──────────────────
     write_run_config(inputs)
     print(f"\n  Run configuration saved to run_config.json")
 
+    # Clear any stale data-fetch marker from a previous run so a fresh transient
+    # failure (if one occurs) is reported against THIS run.
+    fetch_util.clear_fetch_error()
+
     # ── MODULE 0 -- Risk-free rates ────────────────────────────────────────────
+    _progress(1, "Fetching data")
     if not run_subprocess(
         "Module 0", "module0_riskfree.py", "Fetching live risk-free rates"
     ):
-        raise PipelineError("Module 0 failed -- cannot continue without risk-free rates")
+        raise PipelineError(_data_fetch_message(
+            "Module 0 failed -- cannot continue without risk-free rates"))
 
     # ── MODULE 1 -- Prices & returns  (with momentum retry loop) ──────────────
     MAX_RETRIES = 3
@@ -955,11 +994,12 @@ def run_pipeline(tickers, holdings, currency, portfolio_choice,
         write_run_config(inputs)
 
         label = "Module 1" if attempt == 0 else f"Module 1 (retry {attempt})"
+        _progress(2, "Estimating parameters")
         if not run_subprocess(
             label, "module1_data.py",
             "Downloading prices, momentum returns, long-run covariance",
         ):
-            raise PipelineError("Module 1 failed -- cannot continue")
+            raise PipelineError(_data_fetch_message("Module 1 failed -- cannot continue"))
 
         # -- Momentum robustness check --
         print(f"\n{_bar()}")
@@ -999,6 +1039,7 @@ def run_pipeline(tickers, holdings, currency, portfolio_choice,
     #   pools and the risk-free rate) and BEFORE the first CVaR consumer (Module 2
     #   Goal 3). Placed after the Module 1 retry loop so it reflects the FINAL
     #   ticker set.
+    _progress(3, "Running simulation")
     sim_result = run_subprocess(
         "Layer 4", "simulation_engine.py",
         "Monte Carlo scenario engine -> simulated_returns.npz",
@@ -1016,6 +1057,7 @@ def run_pipeline(tickers, holdings, currency, portfolio_choice,
             "Run simulation_engine.py (Layer 4) after Module 1 and before Module 2.")
 
     # ── MODULE 2 -- Optimisation (Layer 3 goals + Goal 3 CVaR over Layer 4) ────
+    _progress(4, "Optimizing")
     if not run_subprocess(
         "Module 2", "module2_optimiser.py", "Mean-variance optimisation"
     ):
@@ -1025,15 +1067,18 @@ def run_pipeline(tickers, holdings, currency, portfolio_choice,
     #   Reuses the simulation's recorded seed so the whole stochastic pipeline is
     #   reproducible from one seed. Resamples ONLY the chosen goal (B=500), so this
     #   is ~1/3 the cost when the choice is known up front.
+    _progress(5, "Resampling")
     base_seed = simulation_seed()
     if not run_layer7(base_seed, inputs.get("portfolio_choice")):
         raise PipelineError("Layer 7 resampling failed -- cannot produce canonical weights")
 
     # ── LAYER 5 -- Risk evaluation (resampled goals + current holdings) ───────
+    _progress(6, "Evaluating risk")
     if not run_layer5(inputs, base_seed):
         _warn("Layer 5 risk evaluation failed -- continuing (rebalancing unaffected).")
 
     # ── MODULE 3 -- Efficient frontier ────────────────────────────────────────
+    _progress(7, "Building frontier")
     if not run_subprocess(
         "Module 3", "module3_frontier.py", "Efficient frontier chart"
     ):
@@ -1065,6 +1110,7 @@ def run_pipeline(tickers, holdings, currency, portfolio_choice,
             )
 
     # ── MODULE 4 -- Rebalancing (non-interactive) ─────────────────────────────
+    _progress(8, "Planning trades")
     if inputs.get("portfolio_choice"):
         rebalance_stats = run_module4(inputs, today_str, interactive=interactive)
     else:
@@ -1076,6 +1122,7 @@ def run_pipeline(tickers, holdings, currency, portfolio_choice,
     #   choice must be persisted to run_config.json first (it may have been
     #   selected after Module 3, leaving the on-disk config stale). Produces
     #   robustness_warnings.json, which Module 5 reads. Never halts the pipeline.
+    _progress(9, "Checking robustness")
     write_run_config(inputs)
     run_subprocess(
         "Layer 6", "robustness_checks.py",
@@ -1085,6 +1132,7 @@ def run_pipeline(tickers, holdings, currency, portfolio_choice,
     # ── MODULE 5 -- Markdown report (optional) ────────────────────────────────
     #   Reads run_config.json (portfolio_choice / holdings / currency, persisted
     #   before Layer 6) plus the upstream artifacts; emits portfolio_report_*.md.
+    _progress(10, "Writing report")
     result5 = run_subprocess(
         "Module 5", "module5_report.py", "Plain-language Markdown portfolio report"
     )

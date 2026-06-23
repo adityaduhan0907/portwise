@@ -18,13 +18,14 @@ so module1, module2, and module3 can read from one shared source of truth.
 import json
 import os
 import sys
-import time
 import warnings
 from datetime import datetime
 
 import numpy as np
 import pandas as pd
-import yfinance as yf
+
+import fetch_util
+from fetch_util import TransientFetchError
 
 warnings.filterwarnings("ignore")
 
@@ -84,23 +85,23 @@ PORTFOLIO_TICKERS = _load_portfolio_tickers()
 
 # ── Fetch helpers ──────────────────────────────────────────────────────────────
 
-def fetch_latest_close(symbol, lookback="10d", max_retries=3, delay=2):
+def fetch_latest_close(symbol, lookback="10d"):
     """
     Return the most recent closing value for a yfinance ticker, or None on
-    any failure (no data, HTTP error, empty frame, etc.).  Retries up to
-    max_retries times before giving up.
+    failure. Hardened with retry/backoff/timeout via fetch_util. This is an
+    AUXILIARY rate proxy with a documented fallback (US/India fallback rates),
+    so even a persistent transient failure returns None -> caller uses the
+    fallback rate rather than aborting the whole pipeline for one rate.
     """
-    for attempt in range(max_retries):
-        try:
-            hist = yf.Ticker(symbol).history(period=lookback, auto_adjust=True)
-            if isinstance(hist.columns, object) and "Close" in hist.columns:
-                close = hist["Close"].dropna()
-                if not close.empty:
-                    return float(close.iloc[-1])
-            return None
-        except Exception:
-            if attempt < max_retries - 1:
-                time.sleep(delay)
+    try:
+        hist = fetch_util.fetch_history(symbol, period=lookback,
+                                        what=f"{symbol} risk-free proxy")
+    except TransientFetchError:
+        return None
+    if hist is not None and not hist.empty and "Close" in hist.columns:
+        close = hist["Close"].dropna()
+        if not close.empty:
+            return float(close.iloc[-1])
     return None
 
 
@@ -268,30 +269,20 @@ def ingest_factor_history(path=FACTOR_PATH):
 def _monthly_history_count(raw_ticker, start="1990-01-01"):
     """
     Return (resolved_symbol, n_months) for one portfolio asset by downloading
-    monthly closes. Mirrors module1's resolution (try as-is, then .NS, .BO).
-    On total failure returns (None, 0).
+    monthly closes. Resolution (as-is, then .NS / .BO) and the hardening live in
+    fetch_util, shared with module 1.
+
+    GENUINE missing data -> (None, 0): a ticker that truly has no monthly history
+    legitimately counts as "short" and trips use_factor_covariance. A persistent
+    TRANSIENT failure RAISES TransientFetchError instead of silently returning 0 --
+    so a network blip can no longer flip the whole portfolio's covariance method.
     """
-    candidates = (
-        [raw_ticker] if "." in raw_ticker
-        else [raw_ticker, f"{raw_ticker}.NS", f"{raw_ticker}.BO"]
+    symbol, series, _reason = fetch_util.resolve_and_fetch(
+        raw_ticker, start=start, end=None, interval="1mo", what="monthly history",
     )
-    for symbol in candidates:
-        try:
-            hist = yf.download(
-                symbol, start=start, interval="1mo",
-                auto_adjust=True, progress=False, threads=False,
-            )
-            if hist is None or hist.empty:
-                continue
-            close = hist["Close"]
-            if isinstance(close, pd.DataFrame):
-                close = close.iloc[:, 0]
-            n = int(close.dropna().shape[0])
-            if n > 0:
-                return symbol, n
-        except Exception:
-            continue
-    return None, 0
+    if series is None:
+        return None, 0
+    return symbol, int(series.dropna().shape[0])
 
 
 def assess_asset_history(tickers):
@@ -512,4 +503,11 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except TransientFetchError as exc:
+        # Loud, named transient failure -> hand the ticker/call to run_all (parent)
+        # and stop, so a network blip never silently flips use_factor_covariance.
+        fetch_util.write_fetch_error(exc.ticker, exc.what, exc.detail, module="module0")
+        print(f"\n  ERROR: {exc}\n")
+        sys.exit(1)
