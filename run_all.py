@@ -68,6 +68,18 @@ _SKIP_LABELS = {
 }
 
 
+def _is_summary_label(name):
+    """
+    True for any non-ticker spacer/summary row: blank/nan, a known summary metric,
+    a 'Portfolio ...' label, or anything carrying a '(%)' metric tag (e.g.
+    'Portfolio CVaR 95% (%)'). Shape-based so footers added later (CVaR, VaR, ...)
+    are rejected too. Mirrors module4_rebalance / module5_report / the app filter.
+    """
+    s = str(name).strip()
+    return (not s) or s.lower() in {x.lower() for x in _SKIP_LABELS} \
+        or s.lower().startswith("portfolio ") or "(%)" in s
+
+
 class PipelineError(RuntimeError):
     """Hard failure that stops the pipeline.
 
@@ -120,7 +132,7 @@ def _load_portfolio_opts(xlsx_path):
             for _, row in df.iterrows():
                 s  = str(row.get("Stock", "")).strip()
                 wt = row.get("Weight (%)", None)
-                if s in _SKIP_LABELS:
+                if _is_summary_label(s):
                     continue
                 try:
                     val = float(wt)
@@ -692,7 +704,7 @@ def check_concentration(inputs):
         for _, row in df.iterrows():
             s  = str(row.get("Stock", "")).strip()
             wt = row.get("Weight (%)", None)
-            if s in _SKIP_LABELS:
+            if _is_summary_label(s):
                 continue
             try:
                 w = float(wt)
@@ -851,8 +863,8 @@ def run_module4(inputs, today_str, interactive=True):
         "total_usd": total_usd,
         "currency":  inputs["currency"],
         "usd_inr":   usd_inr,
-        "actioned":  sum(1 for i in instructions if "Actioned" in i["status"]),
-        "skipped":   sum(1 for i in instructions if "Skipped"  in i["status"]),
+        "actioned":  sum(1 for i in instructions if "Recommended" in i["status"]),
+        "skipped":   sum(1 for i in instructions if "Skipped"     in i["status"]),
         "out_path":  out_path,
     }
 

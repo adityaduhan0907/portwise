@@ -57,6 +57,21 @@ SUMMARY_LABELS = {
 }
 
 
+def _is_summary_label(name):
+    """
+    True for any non-ticker spacer/summary row: blank/nan, a known summary metric,
+    a 'Portfolio ...' label, or anything carrying a '(%)' metric tag (e.g.
+    'Portfolio CVaR 95% (%)'). A bare exact-match list misses metrics added later
+    (CVaR, VaR, ...); this matches on shape so new footers are rejected too.
+
+    Mirrors module5_report._is_summary_label and the app's parse_goal_sheet filter
+    so Module 4, the report and the app all agree on what counts as a ticker.
+    """
+    s = str(name).strip()
+    return (not s) or s.lower() in {x.lower() for x in SUMMARY_LABELS} \
+        or s.lower().startswith("portfolio ") or "(%)" in s
+
+
 # ── Formatting helpers ─────────────────────────────────────────────────────────
 
 def fmt_usd(amount):
@@ -122,8 +137,9 @@ def load_portfolio_options(xlsx_path):
             stock = str(row.get("Stock", "")).strip()
             wt    = row.get("Weight (%)", None)
 
-            # Skip blank rows and summary rows
-            if stock in SUMMARY_LABELS:
+            # Skip blank rows and any summary/footer row (Return, Volatility,
+            # Sharpe, CVaR, ... -- anything that is not a real ticker).
+            if _is_summary_label(stock):
                 continue
 
             try:
@@ -414,14 +430,14 @@ def generate_instructions(positions, target_weights, total_usd, usd_inr_rate):
             # Position exists but has no place in the optimal portfolio
             action = "SELL"
             amount = current_v                 # sell the entire position
-            status = "Actioned"
+            status = "Recommended"
             note   = "Not in optimal portfolio -- exit full position"
 
         elif not in_current:
             # Target portfolio requires this stock but the user holds none
             action = "BUY"
             amount = target_v                  # buy the full target allocation
-            status = "Actioned"
+            status = "Recommended"
             note   = "New position"
 
         elif abs(diff_w) <= THRESHOLD_PCT:
@@ -436,7 +452,7 @@ def generate_instructions(positions, target_weights, total_usd, usd_inr_rate):
             # Meaningful weight difference -- reweight
             action = "BUY" if diff_w > 0 else "SELL"
             amount = abs(diff_usd)
-            status = "Actioned"
+            status = "Recommended"
             note   = f"Reweight {current_w:.2f}% -> {target_w:.2f}%"
 
         instructions.append({
@@ -452,9 +468,9 @@ def generate_instructions(positions, target_weights, total_usd, usd_inr_rate):
             "note":       note,
         })
 
-    # Sort: actioned trades first (largest diff first), then skipped
+    # Sort: recommended trades first (largest diff first), then skipped
     instructions.sort(
-        key=lambda x: (0 if "Actioned" in x["status"] else 1, -abs(x["diff_w"]))
+        key=lambda x: (0 if "Recommended" in x["status"] else 1, -abs(x["diff_w"]))
     )
     return instructions
 
@@ -541,8 +557,8 @@ def print_summary(positions, total_usd, target_name, target_weights,
     print(f"  (Trades with |weight diff| <= {THRESHOLD_PCT:.0f}% are skipped as immaterial)")
     print(_sep("-"))
 
-    actioned = [i for i in instructions if "Actioned" in i["status"]]
-    skipped  = [i for i in instructions if "Skipped"  in i["status"]]
+    actioned = [i for i in instructions if "Recommended" in i["status"]]
+    skipped  = [i for i in instructions if "Skipped"     in i["status"]]
 
     if actioned:
         hdr3 = (f"  {'Action':<5}  {'Ticker':<20}  "
@@ -589,8 +605,8 @@ def export_to_excel(positions, total_usd, target_name, target_weights,
     show_inr  = display_currency == "INR"
     total_inr = total_usd * usd_inr_rate
 
-    actioned_count = sum(1 for i in instructions if "Actioned" in i["status"])
-    skipped_count  = sum(1 for i in instructions if "Skipped"  in i["status"])
+    actioned_count = sum(1 for i in instructions if "Recommended" in i["status"])
+    skipped_count  = sum(1 for i in instructions if "Skipped"     in i["status"])
 
     with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
 
